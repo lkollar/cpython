@@ -31,6 +31,8 @@ def get_name():
     return __name__
 def get_file():
     return __file__
+def get_cached():
+    return __cached__
 """
 test_co = compile(test_src, "<???>", "exec")
 raise_src = 'def do_raise(): raise TypeError\n'
@@ -675,6 +677,24 @@ class UncompressedZipImportTestCase(ImportHooksBaseTestCase):
         files = {TESTMOD + ".py": (NOW, test_src),
                  TESTMOD + pyc_ext: (NOW, pyc)}
         self.doTest(pyc_ext, files, TESTMOD, call=self.assertModuleSource)
+
+    def testGetCompiledSourcePycache(self):
+        pyc = make_pyc(compile(test_src, "<???>", "exec"), NOW, len(test_src))
+        pycache_dir = "__pycache__"
+        pycache_file = os.path.join(
+            pycache_dir, f"{TESTMOD}.{sys.implementation.cache_tag}{pyc_ext}")
+
+        files = {pycache_dir: (NOW, ""),
+                 pycache_file: (NOW, pyc),
+                 TESTMOD + ".py": (NOW, test_src)}
+
+        self.makeZip(files)
+        sys.path.insert(0, TEMP_ZIP)
+
+        mod = importlib.import_module(TESTMOD)
+
+        cached = mod.get_cached()
+        self.assertEqual(cached, os.path.join(TEMP_ZIP, pycache_file))
 
     def runDoctest(self, callback):
         files = {TESTMOD + ".py": (NOW, test_src),
