@@ -23,11 +23,15 @@
 # governing permissions and limitations under the License.
 
 
+import collections
 import importlib.machinery
 import io
 import sys
 import time
 import marshal
+from dataclasses import dataclass
+
+import _remote_debugging
 
 __all__ = ["run", "runctx", "Profile"]
 
@@ -551,11 +555,139 @@ class Profile:
 
 #****************************************************************************
 
+# Sampling profiler #########################################################
+
+class SampleProfile:
+    def __init__(self, pid, sample_interval_usec, all_threads):
+        self.pid = pid
+        self.sample_interval_usec = sample_interval_usec
+        self.all_threads = all_threads
+        self.unwinder = _remote_debugging.RemoteUnwinder(self.pid, all_threads=self.all_threads)
+        self.stats = {}
+
+    def sample(self, duration_sec=10):
+        sample_interval_sec = self.sample_interval_usec / 1_000_000
+        stack_frames = []
+        running_time = 0
+        start_time = next_time = time.perf_counter()
+        errors = 0
+
+        while running_time < duration_sec:
+            next_time += sample_interval_sec
+            sleep_time = next_time - time.perf_counter()
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+            try:
+                stack_frames.append(self.unwinder.get_stack_trace())
+            except RuntimeError, UnicodeDecodeError:
+                errors += 1
+
+            running_time = time.perf_counter() - start_time
+
+        print(f"Captured {len(stack_frames)} samples in {running_time:.2f} seconds")
+        print(f"Sample rate: {len(stack_frames)/running_time:.2f} samples/sec ({1/sample_interval_sec:_}) Hz")
+        print(f"Error rate: {(errors/len(stack_frames))*100:.2f}%")
+
+        expected_samples = int(duration_sec / sample_interval_sec)
+        if len(stack_frames) < expected_samples:
+            print(f"Warning: missed {expected_samples - len(stack_frames):_} samples "
+                f"from the expected total of {expected_samples:_} "
+                f"({(expected_samples - len(stack_frames))/expected_samples*100:.2f}%)")
+
+        t0 = time.perf_counter()
+        self.stats = self.frames_to_pstats(stack_frames)
+        t1 = time.perf_counter()
+        print(f"Processed {len(stack_frames)} stack frames in {t1 - t0:.2f} "
+            f"seconds ({len(stack_frames)/(t1 - t0):.2f} frames/sec)")
+
+    def print_stats(self, sort=-1):
+        import pstats
+        if not isinstance(sort, tuple):
+            sort = (sort,)
+        pstats.Stats(self).strip_dirs().sort_stats(*sort).print_stats()
+
+    def dump_stats(self, file):
+        with open(file, 'wb') as f:
+            marshal.dump(self.stats, f)
+
+    # Needed for compatibility with pstats.Stats
+    def create_stats(self):
+        pass
+
+    def frames_to_pstats(self, stack_frames):
+
+        @dataclass
+        class SampleCounter:
+            total_calls: int
+            total_rec_calls: int
+            inline_calls: int
+
+        result = collections.defaultdict(
+            lambda: SampleCounter(total_calls=0, total_rec_calls=0, inline_calls=0)
+        )
+        sample_interval_sec = self.sample_interval_usec / 1_000_000
+        callers = {}
+
+        # FIXME pstats expects file, line, func triplets, but get_stack_trace emits
+        # func, file, line. Should we reorder these in get_stack_trace instead?
+        for frames_info in stack_frames:
+            for thread_id, frames in frames_info:
+                if not frames:
+                    continue
+                top_location = frames[0]
+                if not top_location in callers:
+                    callers[top_location] = {}
+
+                (func, file, line) = top_location
+                result[(file, line, func)].inline_calls += 1
+                result[(file, line, func)].total_calls += 1
+
+                if len(frames) > 1:
+                    next_frame_loc = frames[1]
+                    callers[top_location][next_frame_loc] = callers[top_location].get(next_frame_loc, 0) + 1
+                else:
+                    continue
+
+                # Note: since the samples are taken at arbitrary times inside
+                # the function calls, it is very unlikely that the top stack
+                # frame will be exactly the recursive function call. Consider
+                # comparing only the file and function pairs for recursion
+                # detection.
+                for location in frames[1:]:
+                    (func, file, line) = location
+                    result[(file, line, func)].total_calls += 1
+                    if top_location == location:
+                        result[(file, line, func)].total_rec_calls += 1
+
+        pstats = {}
+        for fname, call_counts in result.items():
+            total = call_counts.inline_calls * sample_interval_sec
+            cumulative = call_counts.total_calls * sample_interval_sec
+            pstats[fname] = (
+                call_counts.total_calls,
+                call_counts.total_rec_calls if call_counts.total_rec_calls else call_counts.total_calls,
+                total,
+                cumulative,
+                callers, # FIXME this is most certainly broken
+            )
+
+        return pstats
+
+def sample(pid, *, sort=-1, sample_interval_usec=100, duration_sec=10, filename=None):
+    profile = SampleProfile(pid, sample_interval_usec, all_threads=False)
+    profile.sample(duration_sec)
+    if filename:
+        profile.dump_stats(filename)
+    else:
+        profile.print_stats(sort)
+
+
 def main():
     import os
-    from optparse import OptionParser
+    from optparse import OptionParser, OptionGroup
 
-    usage = "profile.py [-o output_file_path] [-s sort] [-m module | scriptfile] [arg] ..."
+    usage = "profile.py [-o output_file_path] [-s sort] [-m module | scriptfile] [arg] [-p pid] [-d duration ] [-i interval ]..."
     parser = OptionParser(usage=usage)
     parser.allow_interspersed_args = False
     parser.add_option('-o', '--outfile', dest="outfile",
@@ -566,11 +698,40 @@ def main():
         help="Sort order when printing to stdout, based on pstats.Stats class",
         default=-1)
 
+
+    sampler_group = OptionGroup(parser, "Sampling profiler options")
+    sampler_group.add_option('-p', '--pid', dest="pid",
+        help="Attach to the specified PID")
+    sampler_group.add_option(
+        '-d',
+        '--duration',
+        type=int,
+        help='Sampling duration in seconds (default: 10)',
+    )
+    sampler_group.add_option(
+        '-i',
+        '--sample-interval',
+        type=int,
+        help="Sample interval in microseconds (default: 100)",
+    )
+    parser.add_option_group(sampler_group)
+
     if not sys.argv[1:]:
         parser.print_usage()
         sys.exit(2)
 
+
     (options, args) = parser.parse_args()
+
+    if options.duration and not options.pid:
+        parser.error("-d is only valid in sampling profiler mode (-p)")
+
+    if options.sample_interval and not options.pid:
+        parser.error("-i is only valid in sampling profiler mode (-p)")
+
+    sampling_duration = options.duration if options.duration is not None else 10
+    sampling_interval = options.sample_interval if options.sample_interval is not None else 100
+
     sys.argv[:] = args
 
     # The script that we're profiling may chdir, so capture the absolute path
@@ -578,8 +739,20 @@ def main():
     if options.outfile is not None:
         options.outfile = os.path.abspath(options.outfile)
 
-    if len(args) > 0:
-        if options.module:
+    if len(args) > 0 or options.pid:
+        if options.pid:
+            pid = int(options.pid)
+            print(f"Sampling PID {pid} for {sampling_duration} seconds "
+                f"with sampling rate of {sampling_interval}usec.")
+
+            sample(pid,
+                   sort=options.sort,
+                   sample_interval_usec=sampling_interval,
+                   duration_sec=sampling_duration,
+                   filename=options.outfile)
+
+            sys.exit(0)
+        elif options.module:
             import runpy
             code = "run_module(modname, run_name='__main__')"
             globs = {
