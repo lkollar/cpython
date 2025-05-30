@@ -566,40 +566,38 @@ class SampleProfile:
         self.stats = {}
 
     def sample(self, duration_sec=10):
+        result = collections.defaultdict(lambda: dict(total_calls=0, total_rec_calls=0, inline_calls=0))
         sample_interval_sec = self.sample_interval_usec / 1_000_000
-        stack_frames = []
         running_time = 0
         start_time = next_time = time.perf_counter()
-        errors = 0
 
+        num_samples = 0
+        errors = 0
         while running_time < duration_sec:
             next_time += sample_interval_sec
             sleep_time = next_time - time.perf_counter()
             if sleep_time > 0:
                 time.sleep(sleep_time)
-
             try:
-                stack_frames.append(self.unwinder.get_stack_trace())
+                stack_frames = self.unwinder.get_stack_trace()
+                self.aggregate_stack_frames(result, stack_frames)
             except RuntimeError, UnicodeDecodeError:
                 errors += 1
 
             running_time = time.perf_counter() - start_time
+            num_samples += 1
 
-        print(f"Captured {len(stack_frames)} samples in {running_time:.2f} seconds")
-        print(f"Sample rate: {len(stack_frames)/running_time:.2f} samples/sec ({1/sample_interval_sec:_}) Hz")
-        print(f"Error rate: {(errors/len(stack_frames))*100:.2f}%")
+        print(f"Captured {num_samples} samples in {running_time:.2f} seconds")
+        print(f"Sample rate: {num_samples/running_time:.2f} samples/sec ({1/sample_interval_sec:_}) Hz")
+        print(f"Error rate: {(errors/num_samples)*100:.2f}%")
 
         expected_samples = int(duration_sec / sample_interval_sec)
-        if len(stack_frames) < expected_samples:
-            print(f"Warning: missed {expected_samples - len(stack_frames):_} samples "
+        if num_samples < expected_samples:
+            print(f"Warning: missed {expected_samples - num_samples:_} samples "
                 f"from the expected total of {expected_samples:_} "
-                f"({(expected_samples - len(stack_frames))/expected_samples*100:.2f}%)")
+                f"({(expected_samples - num_samples)/expected_samples*100:.2f}%)")
 
-        t0 = time.perf_counter()
-        self.stats = self.frames_to_pstats(stack_frames)
-        t1 = time.perf_counter()
-        print(f"Processed {len(stack_frames)} stack frames in {t1 - t0:.2f} "
-            f"seconds ({len(stack_frames)/(t1 - t0):.2f} frames/sec)")
+        self.stats = self.convert_to_pstats(result)
 
     def print_stats(self, sort=-1):
         import pstats
@@ -615,64 +613,52 @@ class SampleProfile:
     def create_stats(self):
         pass
 
-    def frames_to_pstats(self, stack_frames):
-
-        @dataclass
-        class SampleCounter:
-            total_calls: int
-            total_rec_calls: int
-            inline_calls: int
-
-        result = collections.defaultdict(
-            lambda: SampleCounter(total_calls=0, total_rec_calls=0, inline_calls=0)
-        )
+    def convert_to_pstats(self, raw_results):
         sample_interval_sec = self.sample_interval_usec / 1_000_000
-        callers = {}
-
-        # FIXME pstats expects file, line, func triplets, but get_stack_trace emits
-        # func, file, line. Should we reorder these in get_stack_trace instead?
-        for frames_info in stack_frames:
-            for thread_id, frames in frames_info:
-                if not frames:
-                    continue
-                top_location = frames[0]
-                if not top_location in callers:
-                    callers[top_location] = {}
-
-                (func, file, line) = top_location
-                result[(file, line, func)].inline_calls += 1
-                result[(file, line, func)].total_calls += 1
-
-                if len(frames) > 1:
-                    next_frame_loc = frames[1]
-                    callers[top_location][next_frame_loc] = callers[top_location].get(next_frame_loc, 0) + 1
-                else:
-                    continue
-
-                # Note: since the samples are taken at arbitrary times inside
-                # the function calls, it is very unlikely that the top stack
-                # frame will be exactly the recursive function call. Consider
-                # comparing only the file and function pairs for recursion
-                # detection.
-                for location in frames[1:]:
-                    (func, file, line) = location
-                    result[(file, line, func)].total_calls += 1
-                    if top_location == location:
-                        result[(file, line, func)].total_rec_calls += 1
-
         pstats = {}
-        for fname, call_counts in result.items():
-            total = call_counts.inline_calls * sample_interval_sec
-            cumulative = call_counts.total_calls * sample_interval_sec
+        callers = {}
+        for fname, call_counts in raw_results.items():
+            total = call_counts["inline_calls"] * sample_interval_sec
+            cumulative = call_counts["total_calls"] * sample_interval_sec
             pstats[fname] = (
-                call_counts.total_calls,
-                call_counts.total_rec_calls if call_counts.total_rec_calls else call_counts.total_calls,
+                call_counts["total_calls"],
+                call_counts["total_rec_calls"] if call_counts["total_rec_calls"] else call_counts["total_calls"],
                 total,
                 cumulative,
                 callers, # FIXME this is most certainly broken
             )
 
         return pstats
+
+    def aggregate_stack_frames(self, result, stack_frames):
+        callers = {}
+
+        # FIXME pstats expects file, line, func triplets, but get_stack_trace emits
+        # func, file, line. Should we reorder these in get_stack_trace instead?
+        for thread_id, frames in stack_frames:
+            if not frames:
+                continue
+            top_location = frames[0]
+            if not top_location in callers:
+                callers[top_location] = {}
+
+            (func, file, line) = top_location
+            result[(file, line, func)]["inline_calls"] += 1
+            result[(file, line, func)]["total_calls"] += 1
+
+            if len(frames) > 1:
+                next_frame_loc = frames[1]
+                callers[top_location][next_frame_loc] = callers[top_location].get(next_frame_loc, 0) + 1
+            else:
+                continue
+
+            for location in frames[1:]:
+                (func, file, line) = location
+                result[(file, line, func)]["total_calls"] += 1
+                if top_location == location:
+                    result[(file, line, func)]["total_rec_calls"] += 1
+
+
 
 def sample(pid, *, sort=-1, sample_interval_usec=100, duration_sec=10, filename=None):
     profile = SampleProfile(pid, sample_interval_usec, all_threads=False)
