@@ -632,8 +632,6 @@ class SampleProfile:
     def aggregate_stack_frames(self, result, stack_frames):
         callers = {}
 
-        # FIXME pstats expects file, line, func triplets, but get_stack_trace emits
-        # func, file, line. Should we reorder these in get_stack_trace instead?
         for thread_id, frames in stack_frames:
             if not frames:
                 continue
@@ -641,9 +639,8 @@ class SampleProfile:
             if not top_location in callers:
                 callers[top_location] = {}
 
-            (func, file, line) = top_location
-            result[(file, line, func)]["inline_calls"] += 1
-            result[(file, line, func)]["total_calls"] += 1
+            result[top_location]["inline_calls"] += 1
+            result[top_location]["total_calls"] += 1
 
             if len(frames) > 1:
                 next_frame_loc = frames[1]
@@ -652,10 +649,9 @@ class SampleProfile:
                 continue
 
             for location in frames[1:]:
-                (func, file, line) = location
-                result[(file, line, func)]["total_calls"] += 1
+                result[location]["total_calls"] += 1
                 if top_location == location:
-                    result[(file, line, func)]["total_rec_calls"] += 1
+                    result[location]["total_rec_calls"] += 1
 
 
 
