@@ -602,7 +602,7 @@ class SampleProfile:
         import pstats
         if not isinstance(sort, tuple):
             sort = (sort,)
-        pstats.Stats(self).strip_dirs().sort_stats(*sort).print_stats()
+        pstats.SampledStats(self).strip_dirs().sort_stats(*sort).print_stats()
 
     def dump_stats(self, file):
         with open(file, 'wb') as f:
