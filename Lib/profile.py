@@ -568,24 +568,23 @@ class SampleProfile:
     def sample(self, duration_sec=10):
         result = collections.defaultdict(lambda: dict(total_calls=0, total_rec_calls=0, inline_calls=0))
         sample_interval_sec = self.sample_interval_usec / 1_000_000
-        running_time = 0
-        start_time = next_time = time.perf_counter()
 
+        running_time = 0
         num_samples = 0
         errors = 0
+        start_time = next_time = time.perf_counter()
         while running_time < duration_sec:
-            next_time += sample_interval_sec
-            sleep_time = next_time - time.perf_counter()
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-            try:
-                stack_frames = self.unwinder.get_stack_trace()
-                self.aggregate_stack_frames(result, stack_frames)
-            except RuntimeError, UnicodeDecodeError:
-                errors += 1
+            if next_time < time.perf_counter():
+                try:
+                    stack_frames = self.unwinder.get_stack_trace()
+                    self.aggregate_stack_frames(result, stack_frames)
+                except RuntimeError, UnicodeDecodeError:
+                    errors += 1
+
+                num_samples += 1
+                next_time += sample_interval_sec
 
             running_time = time.perf_counter() - start_time
-            num_samples += 1
 
         print(f"Captured {num_samples} samples in {running_time:.2f} seconds")
         print(f"Sample rate: {num_samples/running_time:.2f} samples/sec ({1/sample_interval_sec:_}) Hz")
