@@ -587,13 +587,13 @@ class SampleProfile:
             running_time = time.perf_counter() - start_time
 
         print(f"Captured {num_samples} samples in {running_time:.2f} seconds")
-        print(f"Sample rate: {num_samples/running_time:.2f} samples/sec ({1/sample_interval_sec:_}) Hz")
+        print(f"Sample rate: {num_samples/running_time:.2f} samples/sec")
         print(f"Error rate: {(errors/num_samples)*100:.2f}%")
 
         expected_samples = int(duration_sec / sample_interval_sec)
         if num_samples < expected_samples:
-            print(f"Warning: missed {expected_samples - num_samples:_} samples "
-                f"from the expected total of {expected_samples:_} "
+            print(f"Warning: missed {expected_samples - num_samples} samples "
+                f"from the expected total of {expected_samples} "
                 f"({(expected_samples - num_samples)/expected_samples*100:.2f}%)")
 
         self.stats = self.convert_to_pstats(result)
