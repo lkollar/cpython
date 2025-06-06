@@ -2,6 +2,7 @@ import collections
 import pstats
 import time
 import _remote_debugging
+import argparse
 
 class SampleProfile:
     def __init__(self, pid, sample_interval_usec, all_threads):
@@ -109,7 +110,19 @@ def sample(pid, *, sort=-1, sample_interval_usec=100, duration_sec=10, filename=
         profile.print_stats(sort)
 
 def main():
-    ...
+    parser = argparse.ArgumentParser(description="Sample a process's stack frames.", color=True)
+    parser.add_argument("pid", type=int, help="Process ID to sample.")
+    parser.add_argument(
+        "-i", "--interval", type=int, default=10,
+        help="Sampling interval in microseconds (default: 10 usec)."
+    )
+    parser.add_argument(
+        "-d", "--duration", type=int, default=10,
+        help="Sampling duration in seconds (default: 10 seconds)."
+    )
+    args = parser.parse_args()
+
+    sample(args.pid, sample_interval_usec=args.interval, duration_sec=args.duration)
 
 if __name__ == '__main__':
     main()
