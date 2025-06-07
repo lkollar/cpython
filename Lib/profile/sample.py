@@ -15,6 +15,7 @@ class SampleProfile:
             self.pid, all_threads=self.all_threads
         )
         self.stats = {}
+        self.callers = collections.defaultdict(lambda: collections.defaultdict(int))
 
     def sample(self, duration_sec=10):
         result = collections.defaultdict(
@@ -73,6 +74,7 @@ class SampleProfile:
         for fname, call_counts in raw_results.items():
             total = call_counts["inline_calls"] * sample_interval_sec
             cumulative = call_counts["total_calls"] * sample_interval_sec
+            callers = dict(self.callers.get(fname, {}))
             pstats[fname] = (
                 call_counts["total_calls"],
                 call_counts["total_rec_calls"]
@@ -80,30 +82,25 @@ class SampleProfile:
                 else call_counts["total_calls"],
                 total,
                 cumulative,
-                callers,  # FIXME this is most certainly broken
+                callers,
             )
 
         return pstats
 
     def aggregate_stack_frames(self, result, stack_frames):
-        callers = {}
-
         for thread_id, frames in stack_frames:
             if not frames:
                 continue
             top_location = frames[0]
-            if not top_location in callers:
-                callers[top_location] = {}
-
             result[top_location]["inline_calls"] += 1
             result[top_location]["total_calls"] += 1
 
-            if len(frames) > 1:
-                next_frame_loc = frames[1]
-                callers[top_location][next_frame_loc] = (
-                    callers[top_location].get(next_frame_loc, 0) + 1
-                )
-            else:
+            for i in range(1, len(frames)):
+                callee = frames[i-1]
+                caller = frames[i]
+                self.callers[callee][caller] += 1
+
+            if len(frames) <= 1:
                 continue
 
             for location in frames[1:]:
