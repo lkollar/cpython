@@ -1,5 +1,6 @@
 import collections
 import marshal
+import os
 import pstats
 import time
 import _remote_debugging
@@ -20,8 +21,9 @@ class SampleProfile:
         self.callers = collections.defaultdict(
             lambda: collections.defaultdict(int)
         )
+        self.samples = []  # List of (timestamp, [frames])
 
-    def sample(self, duration_sec=10):
+    def sample(self, duration_sec=10, collect_raw_samples=False):
         result = collections.defaultdict(
             lambda: dict(total_calls=0, total_rec_calls=0, inline_calls=0)
         )
@@ -35,7 +37,9 @@ class SampleProfile:
             if next_time < time.perf_counter():
                 try:
                     stack_frames = self.unwinder.get_stack_trace()
-                    self.aggregate_stack_frames(result, stack_frames)
+                    self.aggregate_stack_frames(
+                        result, stack_frames, collect_raw_samples
+                    )
                 except RuntimeError, UnicodeDecodeError, OSError:
                     errors += 1
 
@@ -279,10 +283,16 @@ class SampleProfile:
 
         return pstats
 
-    def aggregate_stack_frames(self, result, stack_frames):
+    def aggregate_stack_frames(
+        self, result, stack_frames, collect_raw_samples=False
+    ):
+        timestamp = time.perf_counter()  # FIXME
         for thread_id, frames in stack_frames:
             if not frames:
                 continue
+            if collect_raw_samples:
+                # Store (timestamp, frames) for speedscope/collapsed
+                self.samples.append((timestamp, list(frames)))
             top_location = frames[0]
             result[top_location]["inline_calls"] += 1
             result[top_location]["total_calls"] += 1
@@ -300,6 +310,22 @@ class SampleProfile:
                 if top_location == location:
                     result[location]["total_rec_calls"] += 1
 
+    def export_collapsed(self, filename):
+        # Brendan Gregg's collapsed stack format: funcA;funcB;funcC count\n
+        stack_counter = collections.Counter()
+        for _, stack in self.samples:
+            # Stack is innermost frame first, but collapsed format wants root->leaf
+            # So reverse the stack
+            stack_str = ";".join(
+                f"{os.path.basename(f[0])}:{f[2]}:{f[1]}"
+                for f in reversed(stack)
+            )
+            stack_counter[stack_str] += 1
+        with open(filename, "w") as f:
+            for stack, count in stack_counter.items():
+                f.write(f"{stack} {count}\n")
+        print(f"Collapsed stack output written to {filename}")
+
 
 def sample(
     pid,
@@ -311,13 +337,18 @@ def sample(
     all_threads=False,
     limit=None,
     show_summary=True,
+    output_format=None,
 ):
     profile = SampleProfile(pid, sample_interval_usec, all_threads=all_threads)
-    profile.sample(duration_sec)
-    if filename:
-        profile.dump_stats(filename)
-    else:
-        profile.print_stats(sort, limit, show_summary)
+    collect_raw = output_format == "collapsed"
+    profile.sample(duration_sec, collect_raw_samples=collect_raw)
+    match output_format:
+        case None:
+            profile.print_stats(sort, limit, show_summary)
+        case "pstats":
+            profile.dump_stats(filename)
+        case "collapsed":
+            profile.export_collapsed(filename)
 
 
 def main():
@@ -374,6 +405,11 @@ def main():
         help="Disable the summary section at the end of the output",
     )
 
+    parser.add_argument(
+        "--format",
+        help="Output format. Supported formats: pstats (default), collapsed",
+    )
+
     # Add sorting options
     sort_group = parser.add_mutually_exclusive_group()
     sort_group.add_argument(
@@ -428,6 +464,9 @@ def main():
     if args.no_color:
         _colorize.set_theme(_colorize.theme_no_color)
 
+    if args.format and not args.outfile:
+        parser.error("--format needs --outfile")
+
     sample(
         args.pid,
         sample_interval_usec=args.interval,
@@ -437,6 +476,7 @@ def main():
         limit=args.limit,
         sort=args.sort,
         show_summary=not args.no_summary,
+        output_format=args.format,
     )
 
 
