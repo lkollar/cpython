@@ -34,7 +34,7 @@ class SampleProfile:
                 try:
                     stack_frames = self.unwinder.get_stack_trace()
                     self.aggregate_stack_frames(result, stack_frames)
-                except RuntimeError, UnicodeDecodeError:
+                except RuntimeError, UnicodeDecodeError, OSError:
                     errors += 1
 
                 num_samples += 1
@@ -114,7 +114,13 @@ class SampleProfile:
 
 
 def sample(
-    pid, *, sort=-1, sample_interval_usec=100, duration_sec=10, filename=None
+    pid,
+    *,
+    sort=-1,
+    sample_interval_usec=100,
+    duration_sec=10,
+    filename=None,
+    all_threads=False,
 ):
     profile = SampleProfile(pid, sample_interval_usec, all_threads=False)
     profile.sample(duration_sec)
@@ -134,14 +140,20 @@ def main():
         "--interval",
         type=int,
         default=10,
-        help="Sampling interval in microseconds (default: 10 usec).",
+        help="Sampling interval in microseconds (default: 10 usec)",
     )
     parser.add_argument(
         "-d",
         "--duration",
         type=int,
         default=10,
-        help="Sampling duration in seconds (default: 10 seconds).",
+        help="Sampling duration in seconds (default: 10 seconds)",
+    )
+    parser.add_argument(
+        "-a",
+        "--all-threads",
+        action="store_true",
+        help="Sample all threads in the process",
     )
     parser.add_argument("-o", "--outfile", help="Save stats to <outfile>")
     args = parser.parse_args()
@@ -151,6 +163,7 @@ def main():
         sample_interval_usec=args.interval,
         duration_sec=args.duration,
         filename=args.outfile,
+        all_threads=args.all_threads,
     )
 
 
