@@ -185,6 +185,21 @@ function main() {
 // Wait for libraries to load
 document.addEventListener('DOMContentLoaded', function () {
     main();
+
+    const infoBtn = document.getElementById('show-info-btn');
+    const infoPanel = document.getElementById('info-panel');
+    const closeBtn = document.getElementById('close-info-btn');
+    if (infoBtn && infoPanel) {
+        infoBtn.addEventListener('click', function () {
+            const isOpen = infoPanel.style.display === 'block';
+            infoPanel.style.display = isOpen ? 'none' : 'block';
+        });
+    }
+    if (closeBtn && infoPanel) {
+        closeBtn.addEventListener('click', function () {
+            infoPanel.style.display = 'none';
+        });
+    }
 });
 
 
