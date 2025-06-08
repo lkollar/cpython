@@ -71,7 +71,7 @@ class SampleProfile:
                 # Store the complete call stack (reverse order - root first)
                 call_tree = list(reversed(frames))
                 self.call_trees.append(call_tree)
-                
+
                 # Count samples per function
                 for frame in frames:
                     self.function_samples[frame] += 1
@@ -278,59 +278,67 @@ class SampleProfile:
     def generate_flamegraph(self, output_path):
         """Generate a beautiful Python-branded flamegraph HTML file"""
         flamegraph_data = self._convert_to_flamegraph_format()
-        
+
         # Debug output
         num_functions = len(flamegraph_data.get("children", []))
         total_time = flamegraph_data.get("value", 0)
-        print(f"Flamegraph data: {num_functions} root functions, total samples: {total_time}")
-        
+        print(
+            f"Flamegraph data: {num_functions} root functions, total samples: {total_time}"
+        )
+
         if num_functions == 0:
-            print("Warning: No functions found in profiling data. Check if sampling captured any data.")
+            print(
+                "Warning: No functions found in profiling data. Check if sampling captured any data."
+            )
             return
-        
+
         html_content = self._create_flamegraph_html(flamegraph_data)
-        
-        with open(output_path, 'w', encoding='utf-8') as f:
+
+        with open(output_path, "w", encoding="utf-8") as f:
             f.write(html_content)
-        
+
         print(f"Flamegraph saved to: {output_path}")
 
     @functools.lru_cache(maxsize=None)
     def _format_function_name(self, func):
         """Format function name for display in flamegraph - now cached!"""
         filename, lineno, funcname = func
-        
+
         # Shorten long file paths
         if len(filename) > 50:
-            parts = filename.split('/')
+            parts = filename.split("/")
             if len(parts) > 2:
                 filename = f".../{'/'.join(parts[-2:])}"
-        
+
         return f"{funcname} ({filename}:{lineno})"
 
     def _convert_to_flamegraph_format(self):
         """Convert call trees to d3-flamegraph format with optimized hierarchy building"""
         if not self.call_trees:
             return {"name": "No Data", "value": 0, "children": []}
-        
+
         unique_functions = set()
         for call_tree in self.call_trees:
             unique_functions.update(call_tree)
-        
+
         # Create a mapping from function tuples to their formatted names
-        func_to_name = {func: self._format_function_name(func) for func in unique_functions}
-        
+        func_to_name = {
+            func: self._format_function_name(func) for func in unique_functions
+        }
+
         # Build tree structure from all call stacks (following original algorithm exactly)
         root = {"name": "root", "children": {}, "samples": 0}
-        
+
         for call_tree in self.call_trees:
             current_node = root
             current_node["samples"] += 1
-            
+
             # Walk down the call tree (from root to leaf) using pre-computed names
             for func in call_tree:
-                func_name = func_to_name[func]  # Use pre-computed name (major speedup!)
-                
+                func_name = func_to_name[
+                    func
+                ]  # Use pre-computed name (major speedup!)
+
                 if func_name not in current_node["children"]:
                     current_node["children"][func_name] = {
                         "name": func_name,
@@ -338,91 +346,93 @@ class SampleProfile:
                         "children": {},
                         "samples": 0,
                         "filename": func[0],
-                        "lineno": func[1], 
-                        "funcname": func[2]
+                        "lineno": func[1],
+                        "funcname": func[2],
                     }
-                
+
                 current_node = current_node["children"][func_name]
                 current_node["samples"] += 1
-        
+
         def convert_node(node, min_samples=1):
             if node["samples"] < min_samples:
                 return None
-                
+
             # Get source code for this function if it's not the root
             source_code = None
             if "func" in node:
                 source_code = self._get_source_lines(node["func"])
-            
+
             result = {
                 "name": node["name"],
                 "value": node["samples"],  # Each sample represents time
-                "children": []
+                "children": [],
             }
-            
+
             # Add extra metadata if available
             if "filename" in node:
-                result.update({
-                    "filename": node["filename"],
-                    "lineno": node["lineno"],
-                    "funcname": node["funcname"]
-                })
-            
+                result.update(
+                    {
+                        "filename": node["filename"],
+                        "lineno": node["lineno"],
+                        "funcname": node["funcname"],
+                    }
+                )
+
             if source_code:
                 result["source"] = source_code
-            
+
             # Recursively convert children
             child_nodes = []
             for child_name, child_node in node["children"].items():
                 child_result = convert_node(child_node, min_samples)
                 if child_result:
                     child_nodes.append(child_result)
-            
+
             # Sort children by sample count (descending)
             child_nodes.sort(key=lambda x: x["value"], reverse=True)
             result["children"] = child_nodes
-            
+
             return result
-        
+
         # Filter out very small functions (less than 0.1% of total samples)
         total_samples = len(self.call_trees)
         min_samples = max(1, int(total_samples * 0.001))  # 0.1% threshold
-        
+
         converted_root = convert_node(root, min_samples)
-        
+
         if not converted_root or not converted_root["children"]:
             return {"name": "No significant data", "value": 0, "children": []}
-        
+
         # If we only have one root child, make it the root to avoid redundant level
         if len(converted_root["children"]) == 1:
             main_child = converted_root["children"][0]
             main_child["name"] = f"Program Root: {main_child['name']}"
             return main_child
-        
+
         converted_root["name"] = "Program Root"
         return converted_root
-    
+
     def _get_source_lines(self, func):
         """Get source code lines for a function using linecache"""
         import linecache
-        
+
         filename, lineno, funcname = func
-        
+
         try:
             # Get several lines around the function definition
             lines = []
             start_line = max(1, lineno - 2)
             end_line = lineno + 3
-            
+
             for line_num in range(start_line, end_line):
                 line = linecache.getline(filename, line_num)
                 if line.strip():  # Only include non-empty lines
                     # Mark the actual function line
                     marker = "→ " if line_num == lineno else "  "
                     lines.append(f"{marker}{line_num}: {line.rstrip()}")
-            
+
             return lines if lines else None
-            
+
         except Exception:
             # If we can't get source code, return None
             return None
@@ -431,42 +441,42 @@ class SampleProfile:
         """Create a beautiful Python-branded HTML template for the flamegraph"""
         import json
         import os
-        
+
         data_json = json.dumps(data)
-        
+
         # Get the template file path relative to this module
         template_dir = os.path.dirname(__file__)
-        template_path = os.path.join(template_dir, 'flamegraph_template.html')
-        css_path = os.path.join(template_dir, 'flamegraph.css')
-        js_path = os.path.join(template_dir, 'flamegraph.js')
-        
+        template_path = os.path.join(template_dir, "flamegraph_template.html")
+        css_path = os.path.join(template_dir, "flamegraph.css")
+        js_path = os.path.join(template_dir, "flamegraph.js")
+
         try:
             # Read all files
-            with open(template_path, 'r', encoding='utf-8') as f:
+            with open(template_path, "r", encoding="utf-8") as f:
                 html_template = f.read()
-            with open(css_path, 'r', encoding='utf-8') as f:
+            with open(css_path, "r", encoding="utf-8") as f:
                 css_content = f.read()
-            with open(js_path, 'r', encoding='utf-8') as f:
+            with open(js_path, "r", encoding="utf-8") as f:
                 js_content = f.read()
-                
+
             # Replace the placeholders with actual content
             html_template = html_template.replace(
-                '<!-- INLINE_CSS -->',
-                f'<style>\n{css_content}\n</style>'
+                "<!-- INLINE_CSS -->", f"<style>\n{css_content}\n</style>"
             )
             html_template = html_template.replace(
-                '<!-- INLINE_JS -->',
-                f'<script>\n{js_content}\n</script>'
+                "<!-- INLINE_JS -->", f"<script>\n{js_content}\n</script>"
             )
-            
+
             # Replace the placeholder with actual data
-            html_content = html_template.replace('{{FLAMEGRAPH_DATA}}', data_json)
-            
+            html_content = html_template.replace(
+                "{{FLAMEGRAPH_DATA}}", data_json
+            )
+
             return html_content
-            
+
         except FileNotFoundError as e:
             # Fallback to a minimal template if any file is not found
-            return f'''<!DOCTYPE html>
+            return f"""<!DOCTYPE html>
 <html><head><title>Flamegraph Error</title></head>
 <body><h1>Error: Required files not found</h1>
 <p>Could not find required files: {str(e)}</p>
@@ -476,7 +486,7 @@ class SampleProfile:
     <li>flamegraph.css</li>
     <li>flamegraph.js</li>
 </ul>
-</body></html>'''
+</body></html>"""
 
     # Needed for compatibility with pstats.Stats
     def create_stats(self):
