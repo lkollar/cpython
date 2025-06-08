@@ -1,4 +1,3 @@
-
 function main() {
     const data = {{FLAMEGRAPH_DATA}}
 
@@ -103,8 +102,28 @@ function main() {
         const mouseX = event.pageX || event.clientX;
         const mouseY = event.pageY || event.clientY;
 
+        // Calculate tooltip width (default to 320px if not rendered yet)
+        let tooltipWidth = 320;
+        if (this._tooltip && this._tooltip.node()) {
+            const node = this._tooltip.style('opacity', 0).style('display', 'block').node();
+            tooltipWidth = node.offsetWidth || 320;
+            this._tooltip.style('display', null);
+        }
+
+        // Calculate position: if overflow, show to the left of cursor
+        const padding = 10;
+        const rightEdge = mouseX + padding + tooltipWidth;
+        const viewportWidth = window.innerWidth;
+        let left;
+        if (rightEdge > viewportWidth) {
+            left = mouseX - tooltipWidth - padding;
+            if (left < 0) left = padding; // prevent off left edge
+        } else {
+            left = mouseX + padding;
+        }
+
         this._tooltip.html(tooltipHTML)
-            .style('left', (mouseX + 10) + 'px')
+            .style('left', left + 'px')
             .style('top', (mouseY - 10) + 'px')
             .transition()
             .duration(200)
