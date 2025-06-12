@@ -543,17 +543,23 @@ def sample(
     all_threads=False,
     limit=None,
     show_summary=True,
-    flamegraph=None,
+    output_format="pstat",
 ):
     profile = SampleProfile(pid, sample_interval_usec, all_threads=all_threads)
     profile.sample(duration_sec)
-    if filename:
-        profile.dump_stats(filename)
-    else:
-        profile.print_stats(sort, limit, show_summary)
 
-    if flamegraph:
-        profile.generate_flamegraph(flamegraph)
+    match output_format:
+        case "pstat":
+            if filename:
+                profile.dump_stats(filename)
+            else:
+                profile.print_stats(sort, limit, show_summary)
+        case "flamegraph":
+            if not filename:
+                filename = f"flamegraph.{pid}.html"
+            profile.generate_flamegraph(filename)
+        case _:
+            raise ValueError(f"Invalid output format: {output_format}")
 
 
 def main():
@@ -568,11 +574,9 @@ def main():
             "  --sort-cumpercall Sort by cumulative time per call (functions with highest cumulative overhead per call)\n"
             "  --sort-name       Sort by function name (alphabetical order)\n\n"
             "The default sort is by cumulative time (--sort-cumulative).\n\n"
-            "Flamegraph output:\n"
-            "  --flamegraph FILE Generate an interactive HTML flamegraph visualization\n"
-            "                    and save it to FILE. The flamegraph provides a beautiful,\n"
-            "                    interactive way to explore function call performance with\n"
-            "                    Python branding and zooming capabilities."
+            "Output formats:\n"
+            "  --format FORMAT   Output format (pstat or flamegraph, default: pstat)\n"
+            "  -o FILE          Save output to FILE (required for flamegraph format)"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -615,8 +619,10 @@ def main():
         help="Disable the summary section at the end of the output",
     )
     parser.add_argument(
-        "--flamegraph",
-        help="Generate a flamegraph HTML file and save it to the specified path",
+        "--format",
+        choices=["pstat", "flamegraph"],
+        default="pstat",
+        help="Output format (default: pstat)",
     )
 
     # Add sorting options
@@ -682,7 +688,7 @@ def main():
         limit=args.limit,
         sort=args.sort,
         show_summary=not args.no_summary,
-        flamegraph=args.flamegraph,
+        output_format=args.format,
     )
 
 
