@@ -8,6 +8,8 @@ import _colorize
 from _colorize import ANSIColors
 import functools
 import os
+import json
+import uuid
 
 
 class SampleProfile:
@@ -25,6 +27,8 @@ class SampleProfile:
         # Store actual call trees for flamegraph and collapsed format
         self.call_trees = []
         self.function_samples = collections.defaultdict(int)
+        self.start_time = None
+        self.end_time = None
 
     def sample(self, duration_sec=10):
         result = collections.defaultdict(
@@ -35,7 +39,7 @@ class SampleProfile:
         running_time = 0
         num_samples = 0
         errors = 0
-        start_time = next_time = time.perf_counter()
+        self.start_time = next_time = time.perf_counter()
         while running_time < duration_sec:
             if next_time < time.perf_counter():
                 try:
@@ -49,7 +53,9 @@ class SampleProfile:
                 num_samples += 1
                 next_time += sample_interval_sec
 
-            running_time = time.perf_counter() - start_time
+            running_time = time.perf_counter() - self.start_time
+
+        self.end_time = time.perf_counter()
 
         print(f"Captured {num_samples} samples in {running_time:.2f} seconds")
         print(f"Sample rate: {num_samples / running_time:.2f} samples/sec")
@@ -71,7 +77,7 @@ class SampleProfile:
             if frames and len(frames) > 0:
                 # Store the complete call stack (reverse order - root first)
                 call_tree = list(reversed(frames))
-                self.call_trees.append(call_tree)
+                self.call_trees.append((thread_id, call_tree))
 
                 # Count samples per function
                 for frame in frames:
@@ -319,7 +325,7 @@ class SampleProfile:
             return {"name": "No Data", "value": 0, "children": []}
 
         unique_functions = set()
-        for call_tree in self.call_trees:
+        for thread_id, call_tree in self.call_trees:
             unique_functions.update(call_tree)
 
         # Create a mapping from function tuples to their formatted names
@@ -330,7 +336,7 @@ class SampleProfile:
         # Build tree structure from all call stacks (following original algorithm exactly)
         root = {"name": "root", "children": {}, "samples": 0}
 
-        for call_tree in self.call_trees:
+        for thread_id, call_tree in self.call_trees:
             current_node = root
             current_node["samples"] += 1
 
@@ -535,7 +541,7 @@ class SampleProfile:
 
     def export_collapsed(self, filename):
         stack_counter = collections.Counter()
-        for call_tree in self.call_trees:
+        for thread_id, call_tree in self.call_trees:
             # Call tree is already in root->leaf order
             stack_str = ";".join(
                 f"{os.path.basename(f[0])}:{f[2]}:{f[1]}" for f in call_tree
@@ -545,6 +551,77 @@ class SampleProfile:
             for stack, count in stack_counter.items():
                 f.write(f"{stack} {count}\n")
         print(f"Collapsed stack output written to {filename}")
+
+    def export_gte(self, filename):
+        """Export profiling data in Google Trace Event format."""
+        events = []
+        trace_id = str(uuid.uuid4())
+
+        # Convert timestamps to microseconds
+        start_time_us = int(self.start_time * 1_000_000)
+        end_time_us = int(self.end_time * 1_000_000)
+
+        # Create a process event
+        events.append({
+            "name": "process_name",
+            "ph": "M",
+            "pid": self.pid,
+            "tid": 0,
+            "args": {"name": f"Python Process {self.pid}"}
+        })
+
+        # Create thread events for each thread
+        thread_ids = set()
+        for thread_id, _ in self.call_trees:
+            if thread_id not in thread_ids:
+                thread_ids.add(thread_id)
+                events.append({
+                    "name": "thread_name",
+                    "ph": "M",
+                    "pid": self.pid,
+                    "tid": thread_id,
+                    "args": {"name": f"Thread {thread_id}"}
+                })
+
+        # Create function events
+        for thread_id, frames in self.call_trees:
+            if not frames:
+                continue
+
+            # Create a complete event for the entire stack
+            events.append({
+                "name": "stack",
+                "ph": "X",
+                "pid": self.pid,
+                "tid": thread_id,
+                "ts": start_time_us,
+                "dur": end_time_us - start_time_us,
+                "args": {
+                    "stack": [f"{f[0]}:{f[1]}:{f[2]}" for f in frames]
+                }
+            })
+
+            # Create individual function events
+            for i, frame in enumerate(frames):
+                frame_filename, lineno, funcname = frame
+                events.append({
+                    "name": funcname,
+                    "ph": "X",
+                    "pid": self.pid,
+                    "tid": thread_id,
+                    "ts": start_time_us,
+                    "dur": end_time_us - start_time_us,
+                    "args": {
+                        "file": frame_filename,
+                        "line": lineno,
+                        "function": funcname
+                    }
+                })
+
+        # Write the trace file
+        with open(filename, "w") as f:
+            json.dump({"traceEvents": events}, f)
+        print(f"Google Trace Event output written to {filename}")
 
 
 def sample(
@@ -576,6 +653,10 @@ def sample(
             if not filename:
                 filename = f"collapsed.{pid}.txt"
             profile.export_collapsed(filename)
+        case "gte":
+            if not filename:
+                filename = f"trace.{pid}.json"
+            profile.export_gte(filename)
         case _:
             raise ValueError(f"Invalid output format: {output_format}")
 
@@ -588,7 +669,9 @@ def main():
             "  pstat      Standard Python profiler output format\n"
             "  flamegraph Interactive HTML visualization of the call stack\n"
             "  collapsed  Stack traces in collapsed format (file:function:line;file:function:line;... count)\n"
-            "             Useful for generating flamegraphs with tools like flamegraph.pl"
+            "             Useful for generating flamegraphs with tools like flamegraph.pl\n"
+            "  gte        Google Trace Event format, compatible with Chrome's trace viewer\n"
+            "             and other tools that support the Chrome trace format\n\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -632,7 +715,7 @@ def main():
     )
     parser.add_argument(
         "--format",
-        choices=["pstat", "flamegraph", "collapsed"],
+        choices=["pstat", "flamegraph", "collapsed", "gte"],
         default="pstat",
         help="Output format (default: pstat)",
     )
