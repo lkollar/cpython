@@ -7,6 +7,7 @@ import argparse
 import _colorize
 from _colorize import ANSIColors
 import functools
+import os
 
 
 class SampleProfile:
@@ -21,7 +22,7 @@ class SampleProfile:
         self.callers = collections.defaultdict(
             lambda: collections.defaultdict(int)
         )
-        # NEW: Store actual call trees for flamegraph
+        # Store actual call trees for flamegraph and collapsed format
         self.call_trees = []
         self.function_samples = collections.defaultdict(int)
 
@@ -40,7 +41,7 @@ class SampleProfile:
                 try:
                     stack_frames = self.unwinder.get_stack_trace()
                     self.aggregate_stack_frames(result, stack_frames)
-                    # NEW: Store the actual stack traces for flamegraph
+                    # Store the actual stack traces for flamegraph and collapsed format
                     self.store_call_trees(stack_frames)
                 except (RuntimeError, UnicodeDecodeError, OSError):
                     errors += 1
@@ -532,6 +533,19 @@ class SampleProfile:
                 if top_location == location:
                     result[location]["total_rec_calls"] += 1
 
+    def export_collapsed(self, filename):
+        stack_counter = collections.Counter()
+        for call_tree in self.call_trees:
+            # Call tree is already in root->leaf order
+            stack_str = ";".join(
+                f"{os.path.basename(f[0])}:{f[2]}:{f[1]}" for f in call_tree
+            )
+            stack_counter[stack_str] += 1
+        with open(filename, "w") as f:
+            for stack, count in stack_counter.items():
+                f.write(f"{stack} {count}\n")
+        print(f"Collapsed stack output written to {filename}")
+
 
 def sample(
     pid,
@@ -558,6 +572,10 @@ def sample(
             if not filename:
                 filename = f"flamegraph.{pid}.html"
             profile.generate_flamegraph(filename)
+        case "collapsed":
+            if not filename:
+                filename = f"collapsed.{pid}.txt"
+            profile.export_collapsed(filename)
         case _:
             raise ValueError(f"Invalid output format: {output_format}")
 
@@ -566,17 +584,11 @@ def main():
     parser = argparse.ArgumentParser(
         description=(
             "Sample a process's stack frames.\n\n"
-            "Sort options:\n"
-            "  --sort-calls      Sort by number of calls (most called functions first)\n"
-            "  --sort-time       Sort by total time (most time-consuming functions first)\n"
-            "  --sort-cumulative Sort by cumulative time (functions with highest total impact first)\n"
-            "  --sort-percall    Sort by time per call (functions with highest per-call overhead first)\n"
-            "  --sort-cumpercall Sort by cumulative time per call (functions with highest cumulative overhead per call)\n"
-            "  --sort-name       Sort by function name (alphabetical order)\n\n"
-            "The default sort is by cumulative time (--sort-cumulative).\n\n"
-            "Output formats:\n"
-            "  --format FORMAT   Output format (pstat or flamegraph, default: pstat)\n"
-            "  -o FILE          Save output to FILE (required for flamegraph format)"
+            "Format descriptions:\n"
+            "  pstat      Standard Python profiler output format\n"
+            "  flamegraph Interactive HTML visualization of the call stack\n"
+            "  collapsed  Stack traces in collapsed format (file:function:line;file:function:line;... count)\n"
+            "             Useful for generating flamegraphs with tools like flamegraph.pl"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -620,7 +632,7 @@ def main():
     )
     parser.add_argument(
         "--format",
-        choices=["pstat", "flamegraph"],
+        choices=["pstat", "flamegraph", "collapsed"],
         default="pstat",
         help="Output format (default: pstat)",
     )
