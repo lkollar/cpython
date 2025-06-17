@@ -6,6 +6,8 @@ import _remote_debugging
 import argparse
 import _colorize
 from _colorize import ANSIColors
+import functools
+import os
 
 
 class SampleProfile:
@@ -20,6 +22,8 @@ class SampleProfile:
         self.callers = collections.defaultdict(
             lambda: collections.defaultdict(int)
         )
+        self.call_trees = []
+        self.function_samples = collections.defaultdict(int)
 
     def sample(self, duration_sec=10):
         result = collections.defaultdict(
@@ -36,7 +40,8 @@ class SampleProfile:
                 try:
                     stack_frames = self.unwinder.get_stack_trace()
                     self.aggregate_stack_frames(result, stack_frames)
-                except RuntimeError, UnicodeDecodeError, OSError:
+                    self.store_call_trees(stack_frames)
+                except (RuntimeError, UnicodeDecodeError, OSError):
                     errors += 1
 
                 num_samples += 1
@@ -57,6 +62,18 @@ class SampleProfile:
             )
 
         self.stats = self.convert_to_pstats(result)
+
+    def store_call_trees(self, stack_frames):
+        """Store call trees from stack traces for flamegraph generation"""
+        for thread_id, frames in stack_frames:
+            if frames and len(frames) > 0:
+                # Store the complete call stack (reverse order - root first)
+                call_tree = list(reversed(frames))
+                self.call_trees.append(call_tree)
+
+                # Count samples per function
+                for frame in frames:
+                    self.function_samples[frame] += 1
 
     def print_stats(self, sort=-1, limit=None, show_summary=True):
         if not isinstance(sort, tuple):
@@ -299,6 +316,19 @@ class SampleProfile:
                 if top_location == location:
                     result[location]["total_rec_calls"] += 1
 
+    def export_collapsed(self, filename):
+        stack_counter = collections.Counter()
+        for call_tree in self.call_trees:
+            # Call tree is already in root->leaf order
+            stack_str = ";".join(
+                f"{os.path.basename(f[0])}:{f[2]}:{f[1]}" for f in call_tree
+            )
+            stack_counter[stack_str] += 1
+        with open(filename, "w") as f:
+            for stack, count in stack_counter.items():
+                f.write(f"{stack} {count}\n")
+        print(f"Collapsed stack output written to {filename}")
+
 
 def sample(
     pid,
@@ -310,13 +340,23 @@ def sample(
     all_threads=False,
     limit=None,
     show_summary=True,
+    output_format="pstat",
 ):
     profile = SampleProfile(pid, sample_interval_usec, all_threads=all_threads)
     profile.sample(duration_sec)
-    if filename:
-        profile.dump_stats(filename)
-    else:
-        profile.print_stats(sort, limit, show_summary)
+
+    match output_format:
+        case "pstat":
+            if filename:
+                profile.dump_stats(filename)
+            else:
+                profile.print_stats(sort, limit, show_summary)
+        case "collapsed":
+            if not filename:
+                filename = f"collapsed.{pid}.txt"
+            profile.export_collapsed(filename)
+        case _:
+            raise ValueError(f"Invalid output format: {output_format}")
 
 
 def main():
@@ -331,6 +371,10 @@ def main():
             "  --sort-cumpercall Sort by cumulative time per call (functions with highest cumulative overhead per call)\n"
             "  --sort-name       Sort by function name (alphabetical order)\n\n"
             "The default sort is by cumulative time (--sort-cumulative)."
+            "Format descriptions:\n"
+            "  pstat      Standard Python profiler output format\n"
+            "  collapsed  Stack traces in collapsed format (file:function:line;file:function:line;... count)\n"
+            "             Useful for generating flamegraphs with tools like flamegraph.pl"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         color=True,
@@ -372,6 +416,12 @@ def main():
         "--no-summary",
         action="store_true",
         help="Disable the summary section at the end of the output",
+    )
+    parser.add_argument(
+        "--format",
+        choices=["pstat", "collapsed"],
+        default="pstat",
+        help="Output format (default: pstat)",
     )
 
     # Add sorting options
