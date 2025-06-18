@@ -1,16 +1,15 @@
-import collections
-import marshal
-import pstats
-import time
-import _remote_debugging
 import argparse
 import _colorize
+import _remote_debugging
+import pstats
+import time
 from _colorize import ANSIColors
-import functools
-import os
+
+from .pstats_collector import PstatsCollector
+from .stack_collectors import CollapsedStackCollector
 
 
-class SampleProfile:
+class SampleProfiler:
     def __init__(self, pid, sample_interval_usec, all_threads):
         self.pid = pid
         self.sample_interval_usec = sample_interval_usec
@@ -18,19 +17,9 @@ class SampleProfile:
         self.unwinder = _remote_debugging.RemoteUnwinder(
             self.pid, all_threads=self.all_threads
         )
-        self.stats = {}
-        self.callers = collections.defaultdict(
-            lambda: collections.defaultdict(int)
-        )
-        self.call_trees = []
-        self.function_samples = collections.defaultdict(int)
 
-    def sample(self, duration_sec=10):
-        result = collections.defaultdict(
-            lambda: dict(total_calls=0, total_rec_calls=0, inline_calls=0)
-        )
+    def sample(self, collector, duration_sec=10):
         sample_interval_sec = self.sample_interval_usec / 1_000_000
-
         running_time = 0
         num_samples = 0
         errors = 0
@@ -39,8 +28,7 @@ class SampleProfile:
             if next_time < time.perf_counter():
                 try:
                     stack_frames = self.unwinder.get_stack_trace()
-                    self.aggregate_stack_frames(result, stack_frames)
-                    self.store_call_trees(stack_frames)
+                    collector.collect(stack_frames)
                 except (RuntimeError, UnicodeDecodeError, OSError):
                     errors += 1
 
@@ -61,273 +49,191 @@ class SampleProfile:
                 f"({(expected_samples - num_samples) / expected_samples * 100:.2f}%)"
             )
 
-        self.stats = self.convert_to_pstats(result)
 
-    def store_call_trees(self, stack_frames):
-        """Store call trees from stack traces for flamegraph generation"""
-        for thread_id, frames in stack_frames:
-            if frames and len(frames) > 0:
-                # Store the complete call stack (reverse order - root first)
-                call_tree = list(reversed(frames))
-                self.call_trees.append(call_tree)
+def print_sampled_stats(stats, sort=-1, limit=None, show_summary=True):
+    if not isinstance(sort, tuple):
+        sort = (sort,)
 
-                # Count samples per function
-                for frame in frames:
-                    self.function_samples[frame] += 1
+    # Get the stats data
+    stats_list = []
+    for func, (cc, nc, tt, ct, callers) in stats.stats.items():
+        stats_list.append((func, cc, nc, tt, ct, callers))
 
-    def print_stats(self, sort=-1, limit=None, show_summary=True):
-        if not isinstance(sort, tuple):
-            sort = (sort,)
-        stats = pstats.SampledStats(self).strip_dirs()
-
-        # Get the stats data
-        stats_list = []
-        for func, (cc, nc, tt, ct, callers) in stats.stats.items():
-            stats_list.append((func, cc, nc, tt, ct, callers))
-
-        # Sort based on the requested field
-        sort_field = sort[0]
-        if sort_field == -1:  # stdname
-            stats_list.sort(key=lambda x: str(x[0]))
-        elif sort_field == 0:  # calls
-            stats_list.sort(key=lambda x: x[2], reverse=True)
-        elif sort_field == 1:  # time
-            stats_list.sort(key=lambda x: x[3], reverse=True)
-        elif sort_field == 2:  # cumulative
-            stats_list.sort(key=lambda x: x[4], reverse=True)
-        elif sort_field == 3:  # percall
-            stats_list.sort(
-                key=lambda x: x[3] / x[2] if x[2] > 0 else 0, reverse=True
-            )
-        elif sort_field == 4:  # cumpercall
-            stats_list.sort(
-                key=lambda x: x[4] / x[2] if x[2] > 0 else 0, reverse=True
-            )
-
-        # Apply limit if specified
-        if limit is not None:
-            stats_list = stats_list[:limit]
-
-        # Find the maximum values for each column to determine units
-        max_tt = max((tt for _, _, _, tt, _, _ in stats_list), default=0)
-        max_ct = max((ct for _, _, _, _, ct, _ in stats_list), default=0)
-
-        # Determine appropriate units and format strings
-        if max_tt >= 1.0:
-            tt_unit = "s"
-            tt_scale = 1.0
-        elif max_tt >= 0.001:
-            tt_unit = "ms"
-            tt_scale = 1000.0
-        else:
-            tt_unit = "μs"
-            tt_scale = 1000000.0
-
-        if max_ct >= 1.0:
-            ct_unit = "s"
-            ct_scale = 1.0
-        elif max_ct >= 0.001:
-            ct_unit = "ms"
-            ct_scale = 1000.0
-        else:
-            ct_unit = "μs"
-            ct_scale = 1000000.0
-
-        # Print header with colors and units
-        header = (
-            f"{ANSIColors.BOLD_BLUE}Profile Stats:{ANSIColors.RESET}\n"
-            f"{ANSIColors.BOLD_BLUE}nsamples{ANSIColors.RESET} "
-            f"{ANSIColors.BOLD_BLUE}tottime ({tt_unit}){ANSIColors.RESET} "
-            f"{ANSIColors.BOLD_BLUE}persample ({tt_unit}){ANSIColors.RESET} "
-            f"{ANSIColors.BOLD_BLUE}cumtime ({ct_unit}){ANSIColors.RESET} "
-            f"{ANSIColors.BOLD_BLUE}persample ({ct_unit}){ANSIColors.RESET} "
-            f"{ANSIColors.BOLD_BLUE}filename:lineno(function){ANSIColors.RESET}"
+    # Sort based on the requested field
+    sort_field = sort[0]
+    if sort_field == -1:  # stdname
+        stats_list.sort(key=lambda x: str(x[0]))
+    elif sort_field == 0:  # calls
+        stats_list.sort(key=lambda x: x[2], reverse=True)
+    elif sort_field == 1:  # time
+        stats_list.sort(key=lambda x: x[3], reverse=True)
+    elif sort_field == 2:  # cumulative
+        stats_list.sort(key=lambda x: x[4], reverse=True)
+    elif sort_field == 3:  # percall
+        stats_list.sort(
+            key=lambda x: x[3] / x[2] if x[2] > 0 else 0, reverse=True
         )
-        print(header)
+    elif sort_field == 4:  # cumpercall
+        stats_list.sort(
+            key=lambda x: x[4] / x[2] if x[2] > 0 else 0, reverse=True
+        )
 
-        # Print each line with colors
-        for func, cc, nc, tt, ct, callers in stats_list:
-            if nc != cc:
-                ncalls = f"{nc}/{cc}"
-            else:
-                ncalls = str(nc)
+    # Apply limit if specified
+    if limit is not None:
+        stats_list = stats_list[:limit]
 
-            # Format numbers with proper alignment and precision (no colors)
-            tottime = f"{tt * tt_scale:8.3f}"
-            percall = f"{(tt / nc) * tt_scale:8.3f}" if nc > 0 else "    N/A"
-            cumtime = f"{ct * ct_scale:8.3f}"
-            cumpercall = (
-                f"{(ct / nc) * ct_scale:8.3f}" if nc > 0 else "    N/A"
-            )
+    # Find the maximum values for each column to determine units
+    max_tt = max((tt for _, _, _, tt, _, _ in stats_list), default=0)
+    max_ct = max((ct for _, _, _, _, ct, _ in stats_list), default=0)
 
-            # Format the function name with colors
-            func_name = (
-                f"{ANSIColors.GREEN}{func[0]}{ANSIColors.RESET}:"
-                f"{ANSIColors.YELLOW}{func[1]}{ANSIColors.RESET}("
-                f"{ANSIColors.CYAN}{func[2]}{ANSIColors.RESET})"
-            )
+    # Determine appropriate units and format strings
+    if max_tt >= 1.0:
+        tt_unit = "s"
+        tt_scale = 1.0
+    elif max_tt >= 0.001:
+        tt_unit = "ms"
+        tt_scale = 1000.0
+    else:
+        tt_unit = "μs"
+        tt_scale = 1000000.0
 
-            # Print the formatted line
-            print(
-                f"{ncalls:>8}  {tottime}    {percall}        {cumtime}    {cumpercall}        {func_name}"
-            )
+    if max_ct >= 1.0:
+        ct_unit = "s"
+        ct_scale = 1.0
+    elif max_ct >= 0.001:
+        ct_unit = "ms"
+        ct_scale = 1000.0
+    else:
+        ct_unit = "μs"
+        ct_scale = 1000000.0
 
-        def _format_func_name(func):
-            """Format function name with colors."""
-            return (
-                f"{ANSIColors.GREEN}{func[0]}{ANSIColors.RESET}:"
-                f"{ANSIColors.YELLOW}{func[1]}{ANSIColors.RESET}("
-                f"{ANSIColors.CYAN}{func[2]}{ANSIColors.RESET})"
-            )
+    # Print header with colors and units
+    header = (
+        f"{ANSIColors.BOLD_BLUE}Profile Stats:{ANSIColors.RESET}\n"
+        f"{ANSIColors.BOLD_BLUE}nsamples{ANSIColors.RESET} "
+        f"{ANSIColors.BOLD_BLUE}tottime ({tt_unit}){ANSIColors.RESET} "
+        f"{ANSIColors.BOLD_BLUE}persample ({tt_unit}){ANSIColors.RESET} "
+        f"{ANSIColors.BOLD_BLUE}cumtime ({ct_unit}){ANSIColors.RESET} "
+        f"{ANSIColors.BOLD_BLUE}persample ({ct_unit}){ANSIColors.RESET} "
+        f"{ANSIColors.BOLD_BLUE}filename:lineno(function){ANSIColors.RESET}"
+    )
+    print(header)
 
-        def _print_top_functions(
-            stats_list, title, key_func, format_line, n=3
-        ):
-            """Print top N functions sorted by key_func with formatted output."""
-            print(f"\n{ANSIColors.BOLD_BLUE}{title}:{ANSIColors.RESET}")
-            sorted_stats = sorted(stats_list, key=key_func, reverse=True)
-            for stat in sorted_stats[:n]:
-                if line := format_line(stat):
-                    print(f"  {line}")
+    # Print each line with colors
+    for func, cc, nc, tt, ct, callers in stats_list:
+        if nc != cc:
+            ncalls = f"{nc}/{cc}"
+        else:
+            ncalls = str(nc)
 
-        # Print summary of interesting functions if enabled
-        if show_summary and stats_list:
-            print(
-                f"\n{ANSIColors.BOLD_BLUE}Summary of Interesting Functions:{ANSIColors.RESET}"
-            )
+        # Format numbers with proper alignment and precision (no colors)
+        tottime = f"{tt * tt_scale:8.3f}"
+        percall = f"{(tt / nc) * tt_scale:8.3f}" if nc > 0 else "    N/A"
+        cumtime = f"{ct * ct_scale:8.3f}"
+        cumpercall = f"{(ct / nc) * ct_scale:8.3f}" if nc > 0 else "    N/A"
 
-            # Most time-consuming functions (by total time)
-            def format_time_consuming(stat):
-                func, _, nc, tt, _, _ = stat
-                if tt > 0:
-                    return (
-                        f"{tt * tt_scale:8.3f} {tt_unit} total time, "
-                        f"{(tt / nc) * tt_scale:8.3f} {tt_unit} per call: {_format_func_name(func)}"
-                    )
-                return None
+        # Format the function name with colors
+        func_name = (
+            f"{ANSIColors.GREEN}{func[0]}{ANSIColors.RESET}:"
+            f"{ANSIColors.YELLOW}{func[1]}{ANSIColors.RESET}("
+            f"{ANSIColors.CYAN}{func[2]}{ANSIColors.RESET})"
+        )
 
-            _print_top_functions(
-                stats_list,
-                "Most Time-Consuming Functions",
-                key_func=lambda x: x[3],
-                format_line=format_time_consuming,
-            )
+        # Print the formatted line
+        print(
+            f"{ncalls:>8}  {tottime}    {percall}        {cumtime}    {cumpercall}        {func_name}"
+        )
 
-            # Most called functions
-            def format_most_called(stat):
-                func, _, nc, tt, _, _ = stat
-                if nc > 0:
-                    return (
-                        f"{nc:8d} calls, {(tt / nc) * tt_scale:8.3f} {tt_unit} "
-                        f"per call: {_format_func_name(func)}"
-                    )
-                return None
+    def _format_func_name(func):
+        """Format function name with colors."""
+        return (
+            f"{ANSIColors.GREEN}{func[0]}{ANSIColors.RESET}:"
+            f"{ANSIColors.YELLOW}{func[1]}{ANSIColors.RESET}("
+            f"{ANSIColors.CYAN}{func[2]}{ANSIColors.RESET})"
+        )
 
-            _print_top_functions(
-                stats_list,
-                "Most Called Functions",
-                key_func=lambda x: x[2],
-                format_line=format_most_called,
-            )
+    def _print_top_functions(stats_list, title, key_func, format_line, n=3):
+        """Print top N functions sorted by key_func with formatted output."""
+        print(f"\n{ANSIColors.BOLD_BLUE}{title}:{ANSIColors.RESET}")
+        sorted_stats = sorted(stats_list, key=key_func, reverse=True)
+        for stat in sorted_stats[:n]:
+            if line := format_line(stat):
+                print(f"  {line}")
 
-            # Functions with highest per-call overhead
-            def format_overhead(stat):
-                func, _, nc, tt, _, _ = stat
-                if nc > 0 and tt > 0:
-                    return (
-                        f"{(tt / nc) * tt_scale:8.3f} {tt_unit} per call, "
-                        f"{nc:8d} calls: {_format_func_name(func)}"
-                    )
-                return None
+    # Print summary of interesting functions if enabled
+    if show_summary and stats_list:
+        print(
+            f"\n{ANSIColors.BOLD_BLUE}Summary of Interesting Functions:{ANSIColors.RESET}"
+        )
 
-            _print_top_functions(
-                stats_list,
-                "Functions with Highest Per-Call Overhead",
-                key_func=lambda x: x[3] / x[2] if x[2] > 0 else 0,
-                format_line=format_overhead,
-            )
+        # Most time-consuming functions (by total time)
+        def format_time_consuming(stat):
+            func, _, nc, tt, _, _ = stat
+            if tt > 0:
+                return (
+                    f"{tt * tt_scale:8.3f} {tt_unit} total time, "
+                    f"{(tt / nc) * tt_scale:8.3f} {tt_unit} per call: {_format_func_name(func)}"
+                )
+            return None
 
-            # Functions with highest cumulative impact
-            def format_cumulative(stat):
-                func, _, nc, _, ct, _ = stat
-                if ct > 0:
-                    return (
-                        f"{ct * ct_scale:8.3f} {ct_unit} cumulative time, "
-                        f"{(ct / nc) * ct_scale:8.3f} {ct_unit} per call: "
-                        f"{_format_func_name(func)}"
-                    )
-                return None
+        _print_top_functions(
+            stats_list,
+            "Most Time-Consuming Functions",
+            key_func=lambda x: x[3],
+            format_line=format_time_consuming,
+        )
 
-            _print_top_functions(
-                stats_list,
-                "Functions with Highest Cumulative Impact",
-                key_func=lambda x: x[4],
-                format_line=format_cumulative,
-            )
+        # Most called functions
+        def format_most_called(stat):
+            func, _, nc, tt, _, _ = stat
+            if nc > 0:
+                return (
+                    f"{nc:8d} calls, {(tt / nc) * tt_scale:8.3f} {tt_unit} "
+                    f"per call: {_format_func_name(func)}"
+                )
+            return None
 
-    def dump_stats(self, file):
-        stats_with_marker = dict(self.stats)
-        stats_with_marker[("__sampled__",)] = True
-        with open(file, "wb") as f:
-            marshal.dump(stats_with_marker, f)
+        _print_top_functions(
+            stats_list,
+            "Most Called Functions",
+            key_func=lambda x: x[2],
+            format_line=format_most_called,
+        )
 
-    # Needed for compatibility with pstats.Stats
-    def create_stats(self):
-        pass
+        # Functions with highest per-call overhead
+        def format_overhead(stat):
+            func, _, nc, tt, _, _ = stat
+            if nc > 0 and tt > 0:
+                return (
+                    f"{(tt / nc) * tt_scale:8.3f} {tt_unit} per call, "
+                    f"{nc:8d} calls: {_format_func_name(func)}"
+                )
+            return None
 
-    def convert_to_pstats(self, raw_results):
-        sample_interval_sec = self.sample_interval_usec / 1_000_000
-        pstats = {}
-        callers = {}
-        for fname, call_counts in raw_results.items():
-            total = call_counts["inline_calls"] * sample_interval_sec
-            cumulative = call_counts["total_calls"] * sample_interval_sec
-            callers = dict(self.callers.get(fname, {}))
-            pstats[fname] = (
-                call_counts["total_calls"],
-                call_counts["total_rec_calls"]
-                if call_counts["total_rec_calls"]
-                else call_counts["total_calls"],
-                total,
-                cumulative,
-                callers,
-            )
+        _print_top_functions(
+            stats_list,
+            "Functions with Highest Per-Call Overhead",
+            key_func=lambda x: x[3] / x[2] if x[2] > 0 else 0,
+            format_line=format_overhead,
+        )
 
-        return pstats
+        # Functions with highest cumulative impact
+        def format_cumulative(stat):
+            func, _, nc, _, ct, _ = stat
+            if ct > 0:
+                return (
+                    f"{ct * ct_scale:8.3f} {ct_unit} cumulative time, "
+                    f"{(ct / nc) * ct_scale:8.3f} {ct_unit} per call: "
+                    f"{_format_func_name(func)}"
+                )
+            return None
 
-    def aggregate_stack_frames(self, result, stack_frames):
-        for thread_id, frames in stack_frames:
-            if not frames:
-                continue
-            top_location = frames[0]
-            result[top_location]["inline_calls"] += 1
-            result[top_location]["total_calls"] += 1
-
-            for i in range(1, len(frames)):
-                callee = frames[i - 1]
-                caller = frames[i]
-                self.callers[callee][caller] += 1
-
-            if len(frames) <= 1:
-                continue
-
-            for location in frames[1:]:
-                result[location]["total_calls"] += 1
-                if top_location == location:
-                    result[location]["total_rec_calls"] += 1
-
-    def export_collapsed(self, filename):
-        stack_counter = collections.Counter()
-        for call_tree in self.call_trees:
-            # Call tree is already in root->leaf order
-            stack_str = ";".join(
-                f"{os.path.basename(f[0])}:{f[2]}:{f[1]}" for f in call_tree
-            )
-            stack_counter[stack_str] += 1
-        with open(filename, "w") as f:
-            for stack, count in stack_counter.items():
-                f.write(f"{stack} {count}\n")
-        print(f"Collapsed stack output written to {filename}")
+        _print_top_functions(
+            stats_list,
+            "Functions with Highest Cumulative Impact",
+            key_func=lambda x: x[4],
+            format_line=format_cumulative,
+        )
 
 
 def sample(
@@ -340,23 +246,28 @@ def sample(
     all_threads=False,
     limit=None,
     show_summary=True,
-    output_format="pstat",
+    output_format="pstats",
 ):
-    profile = SampleProfile(pid, sample_interval_usec, all_threads=all_threads)
-    profile.sample(duration_sec)
+    profiler = SampleProfiler(
+        pid, sample_interval_usec, all_threads=all_threads
+    )
 
+    collector = None
     match output_format:
-        case "pstat":
-            if filename:
-                profile.dump_stats(filename)
-            else:
-                profile.print_stats(sort, limit, show_summary)
+        case "pstats":
+            collector = PstatsCollector(sample_interval_usec)
         case "collapsed":
-            if not filename:
-                filename = f"collapsed.{pid}.txt"
-            profile.export_collapsed(filename)
+            collector = CollapsedStackCollector()
         case _:
             raise ValueError(f"Invalid output format: {output_format}")
+
+    profiler.sample(collector, duration_sec)
+
+    if output_format == "pstats" and not filename:
+        stats = pstats.SampledStats(collector).strip_dirs()
+        print_sampled_stats(stats, sort, limit, show_summary)
+    else:
+        collector.export(filename)
 
 
 def main():
@@ -372,7 +283,7 @@ def main():
             "  --sort-name       Sort by function name (alphabetical order)\n\n"
             "The default sort is by cumulative time (--sort-cumulative)."
             "Format descriptions:\n"
-            "  pstat      Standard Python profiler output format\n"
+            "  pstats     Standard Python profiler output format\n"
             "  collapsed  Stack traces in collapsed format (file:function:line;file:function:line;... count)\n"
             "             Useful for generating flamegraphs with tools like flamegraph.pl"
         ),
@@ -419,9 +330,9 @@ def main():
     )
     parser.add_argument(
         "--format",
-        choices=["pstat", "collapsed"],
-        default="pstat",
-        help="Output format (default: pstat)",
+        choices=["pstats", "collapsed"],
+        default="pstats",
+        help="Output format (default: pstats)",
     )
 
     # Add sorting options
@@ -487,6 +398,7 @@ def main():
         limit=args.limit,
         sort=args.sort,
         show_summary=not args.no_summary,
+        output_format=args.format,
     )
 
 
