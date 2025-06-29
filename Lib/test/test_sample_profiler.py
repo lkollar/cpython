@@ -15,6 +15,7 @@ import profile.sample
 from profile.pstats_collector import PstatsCollector
 from profile.stack_collectors import (
     CollapsedStackCollector,
+    FlamegraphCollector,
 )
 
 from test.support.os_helper import unlink
@@ -188,6 +189,77 @@ class TestSampleProfilerComponents(unittest.TestCase):
 
         self.assertIn(stack1_expected, lines)
         self.assertIn(stack2_expected, lines)
+
+    def test_flamegraph_collector_basic(self):
+        """Test basic FlamegraphCollector functionality."""
+        collector = FlamegraphCollector()
+
+        # Test empty state (inherits from StackTraceCollector)
+        self.assertEqual(len(collector.call_trees), 0)
+        self.assertEqual(len(collector.function_samples), 0)
+
+        # Test collecting sample data
+        test_frames = [
+            (1, [("file.py", 10, "func1"), ("file.py", 20, "func2")])
+        ]
+        collector.collect(test_frames)
+
+        # Should store call tree (reversed)
+        self.assertEqual(len(collector.call_trees), 1)
+        expected_tree = [("file.py", 20, "func2"), ("file.py", 10, "func1")]
+        self.assertEqual(collector.call_trees[0], expected_tree)
+
+        # Should count function samples
+        self.assertEqual(
+            collector.function_samples[("file.py", 10, "func1")], 1
+        )
+        self.assertEqual(
+            collector.function_samples[("file.py", 20, "func2")], 1
+        )
+
+    def test_flamegraph_collector_export(self):
+        """Test flamegraph HTML export functionality."""
+        flamegraph_out = tempfile.NamedTemporaryFile(
+            suffix=".html", delete=False
+        )
+        self.addCleanup(close_and_unlink, flamegraph_out)
+
+        collector = FlamegraphCollector()
+
+        # Create some test data
+        test_frames1 = [
+            (1, [("file.py", 10, "func1"), ("file.py", 20, "func2")])
+        ]
+        test_frames2 = [
+            (1, [("file.py", 10, "func1"), ("file.py", 20, "func2")])
+        ]  # Same stack
+        test_frames3 = [(1, [("other.py", 5, "other_func")])]
+
+        collector.collect(test_frames1)
+        collector.collect(test_frames2)
+        collector.collect(test_frames3)
+
+        # Export flamegraph
+        collector.export(flamegraph_out.name)
+
+        # Verify file was created and contains valid data
+        self.assertTrue(os.path.exists(flamegraph_out.name))
+        self.assertGreater(os.path.getsize(flamegraph_out.name), 0)
+
+        # Check file contains HTML content
+        with open(flamegraph_out.name, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Should be valid HTML
+        self.assertIn("<!doctype html>", content.lower())
+        self.assertIn("<html", content)
+        self.assertIn("Python Performance Flamegraph", content)
+        self.assertIn("d3-flame-graph", content)
+
+        # Should contain the data
+        self.assertIn('"name":', content)
+        self.assertIn('"value":', content)
+        self.assertIn('"children":', content)
 
     def test_pstats_collector_export(self):
         collector = PstatsCollector(
@@ -450,6 +522,52 @@ if __name__ == "__main__":
                         # Each part should be file:function:line
                         self.assertIn(":", part)
 
+    def test_sampling_with_flamegraph_export(self):
+        flamegraph_file = tempfile.NamedTemporaryFile(
+            suffix=".html", delete=False
+        )
+        self.addCleanup(close_and_unlink, flamegraph_file)
+
+        with (
+            test_subprocess(self.test_script) as proc,
+        ):
+            # Suppress profiler output when testing file export
+            with (
+                io.StringIO() as captured_output,
+                mock.patch("sys.stdout", captured_output),
+            ):
+                try:
+                    profile.sample.sample(
+                        proc.pid,
+                        duration_sec=1,
+                        filename=flamegraph_file.name,
+                        output_format="flamegraph",
+                        sample_interval_usec=10000,
+                    )
+                except PermissionError:
+                    self.skipTest(
+                        "Insufficient permissions for remote profiling"
+                    )
+
+            # Verify file was created and contains valid data
+            self.assertTrue(os.path.exists(flamegraph_file.name))
+            self.assertGreater(os.path.getsize(flamegraph_file.name), 0)
+
+            # Check file contains HTML content
+            with open(flamegraph_file.name, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            # Should be valid HTML
+            self.assertIn("<!doctype html>", content.lower())
+            self.assertIn("<html", content)
+            self.assertIn("Python Performance Flamegraph", content)
+            self.assertIn("d3-flame-graph", content)
+
+            # Should contain the data
+            self.assertIn('"name":', content)
+            self.assertIn('"value":', content)
+            self.assertIn('"children":', content)
+
     def test_sampling_all_threads(self):
         with (
             test_subprocess(self.test_script) as proc,
@@ -506,6 +624,24 @@ class TestSampleProfilerErrorHandling(unittest.TestCase):
                 output_format="invalid_format",
             )
 
+    def test_valid_output_formats(self):
+        """Test that all valid output formats are accepted."""
+        valid_formats = ["pstats", "collapsed", "flamegraph"]
+
+        for fmt in valid_formats:
+            # Should not raise ValueError
+            try:
+                # This will likely fail with permissions, but the format should be valid
+                profile.sample.sample(
+                    os.getpid(),
+                    duration_sec=0.1,
+                    output_format=fmt,
+                    filename=f"test_{fmt}.out",
+                )
+            except (OSError, RuntimeError, PermissionError):
+                # Expected errors - we just want to test format validation
+                pass
+
 
 class TestSampleProfilerCLI(unittest.TestCase):
     def test_argument_parsing_basic(self):
@@ -555,6 +691,27 @@ class TestSampleProfilerCLI(unittest.TestCase):
                     expected_sort_value,
                 )
                 mock_sample.reset_mock()
+
+    def test_flamegraph_format_option(self):
+        test_args = ["profile.sample", "--format", "flamegraph", "12345"]
+
+        with (
+            mock.patch("sys.argv", test_args),
+            mock.patch("profile.sample.sample") as mock_sample,
+        ):
+            profile.sample.main()
+
+            mock_sample.assert_called_once_with(
+                12345,
+                sample_interval_usec=10,
+                duration_sec=10,
+                filename=None,
+                all_threads=False,
+                limit=None,
+                sort=2,
+                show_summary=True,
+                output_format="flamegraph",
+            )
 
 
 if __name__ == "__main__":

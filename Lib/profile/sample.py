@@ -6,7 +6,7 @@ import time
 from _colorize import ANSIColors
 
 from .pstats_collector import PstatsCollector
-from .stack_collectors import CollapsedStackCollector
+from .stack_collectors import CollapsedStackCollector, FlamegraphCollector
 
 
 class SampleProfiler:
@@ -259,6 +259,9 @@ def sample(
         case "collapsed":
             collector = CollapsedStackCollector()
             filename = filename or f"collapsed.{pid}.txt"
+        case "flamegraph":
+            collector = FlamegraphCollector()
+            filename = filename or f"flamegraph.{pid}.html"
         case _:
             raise ValueError(f"Invalid output format: {output_format}")
 
@@ -286,7 +289,8 @@ def main():
             "Format descriptions:\n"
             "  pstats     Standard Python profiler output format\n"
             "  collapsed  Stack traces in collapsed format (file:function:line;file:function:line;... count)\n"
-            "             Useful for generating flamegraphs with tools like flamegraph.pl"
+            "             Useful for generating flamegraphs with tools like flamegraph.pl\n"
+            "  flamegraph Interactive HTML flamegraph visualization (requires web browser)"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         color=True,
@@ -331,7 +335,7 @@ def main():
     )
     parser.add_argument(
         "--format",
-        choices=["pstats", "collapsed"],
+        choices=["pstats", "collapsed", "flamegraph"],
         default="pstats",
         help="Output format (default: pstats)",
     )
