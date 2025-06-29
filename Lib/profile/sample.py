@@ -10,7 +10,7 @@ from collections import deque
 from _colorize import ANSIColors
 
 from .pstats_collector import PstatsCollector
-from .stack_collector import CollapsedStackCollector
+from .stack_collector import CollapsedStackCollector, FlamegraphCollector
 
 FREE_THREADED_BUILD = sysconfig.get_config_var("Py_GIL_DISABLED") is not None
 
@@ -496,6 +496,9 @@ def sample(
         case "collapsed":
             collector = CollapsedStackCollector()
             filename = filename or f"collapsed.{pid}.txt"
+        case "flamegraph":
+            collector = FlamegraphCollector()
+            filename = filename or f"flamegraph.{pid}.html"
         case _:
             raise ValueError(f"Invalid output format: {output_format}")
 
@@ -542,9 +545,10 @@ def main():
     parser = argparse.ArgumentParser(
         description=(
             "Sample a process's stack frames and generate profiling data.\n"
-            "Supports two output formats:\n"
+            "Supports the following output formats:\n"
             "  - pstats: Detailed profiling statistics with sorting options\n"
             "  - collapsed: Stack traces for generating flamegraphs\n"
+            "  - flamegraph Interactive HTML flamegraph visualization (requires web browser)"
             "\n"
             "Examples:\n"
             "  # Profile process 1234 for 10 seconds with default settings\n"
@@ -630,12 +634,19 @@ def main():
         dest="format",
         help="Generate collapsed stack traces for flamegraphs",
     )
+    output_format.add_argument(
+        "--flamegraph",
+        action="store_const",
+        const="flamegraph",
+        dest="format",
+        help="Generate HTML flamegraph visualization",
+    )
 
     output_group.add_argument(
         "-o",
         "--outfile",
         help="Save output to a file (if omitted, prints to stdout for pstats, "
-        "or saves to collapsed.<pid>.txt for collapsed format)",
+        "or saves to collapsed.<pid>.txt or flamegraph.<pid>.html)"
     )
 
     # pstats-specific options
