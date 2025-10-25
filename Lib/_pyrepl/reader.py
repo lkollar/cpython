@@ -27,6 +27,8 @@ import _colorize
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 
+import enum
+
 from . import commands, console, input
 from .utils import wlen, unbracket, disp_str, gen_colors, THEME
 from .trace import trace
@@ -39,6 +41,28 @@ from .types import Callback, SimpleContextManager, KeySpec, CommandName
 
 # syntax classes
 SYNTAX_WHITESPACE, SYNTAX_WORD, SYNTAX_SYMBOL = range(3)
+
+
+class Mode(str, enum.Enum):
+    INSERT = "insert"
+    NORMAL = "normal"
+
+
+@dataclass
+class EditorConfig:
+    """Configuration for editor behavior."""
+    use_vi_mode: bool = False
+
+
+class EditorMode:
+    def __init__(self, mode: Mode = Mode.INSERT) -> None:
+        self.mode = mode
+
+    def is_insert(self) -> bool:
+        return self.mode == Mode.INSERT
+
+    def is_normal(self) -> bool:
+        return self.mode == Mode.NORMAL
 
 
 def make_default_syntax_table() -> dict[str, int]:
@@ -131,6 +155,68 @@ default_keymap: tuple[tuple[KeySpec, CommandName], ...] = tuple(
 )
 
 
+vi_insert_keymap: tuple[tuple[KeySpec, CommandName], ...] = tuple(
+    [binding for binding in default_keymap if not binding[0].startswith((r"\M-", r"\x1b", r"\EOF", r"\EOH"))] +
+    [(r"\<escape>", "vi-normal-mode")]
+)
+
+
+vi_normal_keymap: tuple[tuple[KeySpec, CommandName], ...] = tuple(
+    [
+        # Basic motions
+        (r"h", "left"),
+        (r"j", "down"),
+        (r"k", "up"),
+        (r"l", "right"),
+        (r"0", "beginning-of-line"),
+        (r"$", "end-of-line"),
+        (r"w", "forward-word"),
+        (r"b", "backward-word"),
+        (r"e", "forward-word"),  # TODO: end-of-word semantics differ from Emacs
+        (r"^", "beginning-of-line"),  # TODO: first non-whitespace
+
+        # Edit commands
+        (r"x", "delete"),
+        (r"i", "vi-insert-mode"),
+        (r"a", "vi-append-mode"),
+        (r"A", "vi-append-eol"),
+        (r"I", "vi-insert-bol"),
+        (r"o", "vi-open-below"),
+        (r"O", "vi-open-above"),
+
+        # Special keys still work in normal mode
+        (r"\<left>", "left"),
+        (r"\<right>", "right"),
+        (r"\<up>", "up"),
+        (r"\<down>", "down"),
+        (r"\<home>", "beginning-of-line"),
+        (r"\<end>", "end-of-line"),
+        (r"\<delete>", "delete"),
+        (r"\<backspace>", "left"),  # In vi, backspace moves left in normal mode
+
+        # Control keys (important ones that work in both modes)
+        (r"\C-c", "interrupt"),
+        (r"\C-d", "delete"),  # or could be EOF
+        (r"\C-l", "clear-screen"),
+        (r"\C-r", "reverse-history-isearch"),  # History search works in normal mode
+
+        # Digit args for counts (1-9, not 0 which is BOL)
+        (r"1", "digit-arg"),
+        (r"2", "digit-arg"),
+        (r"3", "digit-arg"),
+        (r"4", "digit-arg"),
+        (r"5", "digit-arg"),
+        (r"6", "digit-arg"),
+        (r"7", "digit-arg"),
+        (r"8", "digit-arg"),
+        (r"9", "digit-arg"),
+
+        # ESC in normal mode does nothing (could beep or cancel pending operations)
+        (r"\<escape>", "invalid-key"),
+    ]
+)
+
+
 @dataclass(slots=True)
 class Reader:
     """The Reader class implements the bare bones of a command reader,
@@ -214,6 +300,8 @@ class Reader:
     scheduled_commands: list[str] = field(default_factory=list)
     can_colorize: bool = False
     threading_hook: Callback | None = None
+    editor_config: EditorConfig = field(default_factory=EditorConfig)
+    editor_mode: EditorMode = field(default_factory=EditorMode)
 
     ## cached metadata to speed up screen refreshes
     @dataclass
@@ -281,6 +369,11 @@ class Reader:
         self.last_refresh_cache.dimensions = (0, 0)
 
     def collect_keymap(self) -> tuple[tuple[KeySpec, CommandName], ...]:
+        if self.editor_config.use_vi_mode:
+            if self.editor_mode.is_insert():
+                return vi_insert_keymap
+            elif self.editor_mode.is_normal():
+                return vi_normal_keymap
         return default_keymap
 
     def calc_screen(self) -> list[str]:
@@ -490,6 +583,15 @@ class Reader:
         else:
             prompt = self.ps1
 
+        if (
+            self.editor_config.use_vi_mode
+            and cursor_on_line
+            and prompt == self.ps1
+        ):
+            in_insert = self.editor_mode.is_insert()
+            indicator = "[I] " if in_insert else "[N] "
+            prompt = f"{indicator}{prompt}"
+
         if self.can_colorize:
             t = THEME()
             prompt = f"{t.prompt}{prompt}{t.reset}"
@@ -589,6 +691,8 @@ class Reader:
             self.pos = 0
             self.dirty = True
             self.last_command = None
+            if self.editor_config.use_vi_mode:
+                self.enter_insert_mode()
             self.calc_screen()
         except BaseException:
             self.restore()
@@ -760,3 +864,31 @@ class Reader:
     def get_unicode(self) -> str:
         """Return the current buffer as a unicode string."""
         return "".join(self.buffer)
+
+    def enter_insert_mode(self) -> None:
+        if self.editor_mode.is_insert():
+            return
+
+        self.editor_mode.mode = Mode.INSERT
+
+        # Switch translator to insert mode keymap
+        self.keymap = self.collect_keymap()
+        self.input_trans = input.KeymapTranslator(
+            self.keymap, invalid_cls="invalid-key", character_cls="self-insert"
+        )
+
+        self.dirty = True
+
+    def enter_normal_mode(self) -> None:
+        if self.editor_mode.is_normal():
+            return
+
+        self.editor_mode.mode = Mode.NORMAL
+
+        # Switch translator to normal mode keymap
+        self.keymap = self.collect_keymap()
+        self.input_trans = input.KeymapTranslator(
+            self.keymap, invalid_cls="invalid-key", character_cls="invalid-key"
+        )
+
+        self.dirty = True

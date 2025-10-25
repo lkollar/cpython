@@ -40,9 +40,12 @@ from . import commands, historical_reader
 from .completing_reader import CompletingReader
 from .console import Console as ConsoleType
 from ._module_completer import ModuleCompleter, make_default_module_completer
+from .reader import EditorConfig
 
 Console: type[ConsoleType]
 _error: tuple[type[Exception], ...] | type[Exception]
+
+_vi_mode_enabled: bool = False
 
 if os.name == "nt":
     from .windows_console import WindowsConsole as Console, _error
@@ -65,6 +68,13 @@ if TYPE_CHECKING:
 
 MoreLinesCallable = Callable[[str], bool]
 
+
+def set_vi_mode(enabled: bool) -> None:
+    global _vi_mode_enabled
+    _vi_mode_enabled = enabled
+
+if os.environ.get("PYREPL_VI_MODE", "").lower() in {"1", "true", "on", "yes"}:
+    _vi_mode_enabled = True
 
 __all__ = [
     "add_history",
@@ -362,7 +372,12 @@ class _ReadlineWrapper:
     def get_reader(self) -> ReadlineAlikeReader:
         if self.reader is None:
             console = Console(self.f_in, self.f_out, encoding=ENCODING)
-            self.reader = ReadlineAlikeReader(console=console, config=self.config)
+            editor_config = EditorConfig(use_vi_mode=_vi_mode_enabled)
+            self.reader = ReadlineAlikeReader(
+                console=console,
+                config=self.config,
+                editor_config=editor_config
+            )
         return self.reader
 
     def input(self, prompt: object = "") -> str:
