@@ -161,6 +161,8 @@ class UnixConsole(Console):
 
         self.pollob = poll()
         self.pollob.register(self.input_fd, select.POLLIN)
+        self.prefer_vi_escape = False
+        self._vi_escape_timeout_ms = 5
         self.terminfo = terminfo.TermInfo(term or None)
         self.term = term
         self.is_apple_terminal = (
@@ -419,6 +421,10 @@ class UnixConsole(Console):
             return None
 
         while self.event_queue.empty():
+            if self._pending_escape_needs_resolution():
+                if not self.wait(self._vi_escape_timeout_ms):
+                    self._emit_pending_escape()
+                    break
             while True:
                 try:
                     self.push_char(self.__read(1))
@@ -444,6 +450,23 @@ class UnixConsole(Console):
             not self.event_queue.empty()
             or bool(self.pollob.poll(timeout))
         )
+
+    def set_prefer_vi_escape(self, enabled: bool) -> None:
+        self.prefer_vi_escape = enabled
+
+    def _pending_escape_needs_resolution(self) -> bool:
+        return (
+            self.prefer_vi_escape
+            and len(self.event_queue.buf) == 1
+            and self.event_queue.buf[0] == 27
+            and self.event_queue.keymap is not self.event_queue.compiled_keymap
+        )
+
+    def _emit_pending_escape(self) -> None:
+        self.event_queue.keymap = self.event_queue.compiled_keymap
+        self.event_queue.insert(Event('key', '\033', b'\033'))
+        for _c in self.event_queue.flush_buf()[1:]:
+            self.event_queue.push(_c)
 
     def set_cursor_vis(self, visible):
         """
