@@ -503,3 +503,56 @@ class perform_bracketed_paste(Command):
         )
         self.reader.insert(data.replace(done, ""))
         self.reader.last_refresh_cache.invalidated = True
+
+
+class vi_normal_mode(Command):
+    def do(self) -> None:
+        self.reader.enter_normal_mode()
+
+
+class vi_insert_mode(Command):
+    def do(self) -> None:
+        self.reader.enter_insert_mode()
+
+
+class vi_append_mode(Command):
+    def do(self) -> None:
+        if self.reader.pos < len(self.reader.buffer):
+            self.reader.pos += 1
+        self.reader.enter_insert_mode()
+
+
+class vi_append_eol(Command):
+    def do(self) -> None:
+        while self.reader.pos < len(self.reader.buffer):
+            if self.reader.buffer[self.reader.pos] == '\n':
+                break
+            self.reader.pos += 1
+        self.reader.enter_insert_mode()
+
+
+class vi_insert_bol(Command):
+    def do(self) -> None:
+        while self.reader.pos > 0 and self.reader.buffer[self.reader.pos - 1] != '\n':
+            self.reader.pos -= 1
+        # TODO: In true vi, 'I' goes to first non-whitespace character
+        self.reader.enter_insert_mode()
+
+class vi_open_below(Command):
+    def do(self) -> None:
+        while self.reader.pos < len(self.reader.buffer):
+            if self.reader.buffer[self.reader.pos] == '\n':
+                break
+            self.reader.pos += 1
+
+        self.reader.insert('\n')
+        self.reader.enter_insert_mode()
+
+class vi_open_above(Command):
+    def do(self) -> None:
+        while self.reader.pos > 0 and self.reader.buffer[self.reader.pos - 1] != '\n':
+            self.reader.pos -= 1
+
+        self.reader.insert('\n')
+        self.reader.pos -= 1
+        self.reader.enter_insert_mode()

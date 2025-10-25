@@ -558,3 +558,133 @@ class TestReaderInColor(ScreenEqualMixin, TestCase):
         reader, _ = handle_all_events(events)
         self.assert_screen_equal(reader, 'flag = "🏳️\\u200d🌈"', clean=True)
         self.assert_screen_equal(reader, 'flag {o}={z} {s}"🏳️\\u200d🌈"{z}'.format(**colors))
+
+
+@force_not_colorized_test_class
+class TestViMode(TestCase):
+    def _run_vi(self, events, prepare_reader_hook=prepare_vi_reader):
+        return handle_all_events(events, prepare_reader=prepare_reader_hook)
+
+    def test_insert_typing_and_ctrl_a_e(self):
+        events = itertools.chain(
+            code_to_events("hello"),
+            [
+                Event(evt="key", data="\x01", raw=bytearray(b"\x01")),  # Ctrl-A
+                Event(evt="key", data="X", raw=bytearray(b"X")),
+                Event(evt="key", data="\x05", raw=bytearray(b"\x05")),  # Ctrl-E
+                Event(evt="key", data="!", raw=bytearray(b"!")),
+            ],
+        )
+        reader, _ = self._run_vi(events)
+        self.assertEqual(reader.get_unicode(), "Xhello!")
+        self.assertTrue(reader.editor_mode.is_insert())
+
+    def test_escape_switches_to_normal_mode_and_is_idempotent(self):
+        events = itertools.chain(
+            code_to_events("hello"),
+            [
+                Event(evt="key", data="\x1b", raw=bytearray(b"\x1b")),
+                Event(evt="key", data="\x1b", raw=bytearray(b"\x1b")),
+                Event(evt="key", data="h", raw=bytearray(b"h")),
+            ],
+        )
+        reader, _ = self._run_vi(events)
+        self.assertEqual(reader.get_unicode(), "hello")
+        self.assertTrue(reader.editor_mode.is_normal())
+        self.assertEqual(reader.pos, len("hello") - 1)
+
+    def test_normal_mode_motion_and_edit_commands(self):
+        events = itertools.chain(
+            code_to_events("hello"),
+            [
+                Event(evt="key", data="\x1b", raw=bytearray(b"\x1b")),  # ESC
+                Event(evt="key", data="0", raw=bytearray(b"0")),        # go to bol
+                Event(evt="key", data="l", raw=bytearray(b"l")),        # right
+                Event(evt="key", data="x", raw=bytearray(b"x")),        # delete
+                Event(evt="key", data="a", raw=bytearray(b"a")),        # append
+                Event(evt="key", data="!", raw=bytearray(b"!")),
+                Event(evt="key", data="\x1b", raw=bytearray(b"\x1b")),
+            ],
+        )
+        reader, _ = self._run_vi(events)
+        self.assertEqual(reader.get_unicode(), "hl!lo")
+        self.assertTrue(reader.editor_mode.is_normal())
+
+    def test_open_below_and_above(self):
+        events = itertools.chain(
+            code_to_events("first"),
+            [
+                Event(evt="key", data="\x1b", raw=bytearray(b"\x1b")),
+                Event(evt="key", data="o", raw=bytearray(b"o")),
+            ],
+            code_to_events("second"),
+            [
+                Event(evt="key", data="\x1b", raw=bytearray(b"\x1b")),
+                Event(evt="key", data="O", raw=bytearray(b"O")),
+            ],
+            code_to_events("zero"),
+            [Event(evt="key", data="\x1b", raw=bytearray(b"\x1b"))],
+        )
+        reader, _ = self._run_vi(events)
+        self.assertEqual(reader.get_unicode(), "first\nzero\nsecond")
+
+    def test_mode_resets_to_insert_on_prepare(self):
+        events = itertools.chain(
+            code_to_events("text"),
+            [
+                Event(evt="key", data="\x1b", raw=bytearray(b"\x1b")),
+            ],
+        )
+        reader, console = self._run_vi(events)
+        self.assertTrue(reader.editor_mode.is_normal())
+        reader.prepare()
+        self.assertTrue(reader.editor_mode.is_insert())
+        console.prepare.assert_called()  # ensure console prepare called again
+
+    def test_translator_stack_preserves_mode(self):
+        events_insert_path = itertools.chain(
+            code_to_events("hello"),
+            [
+                Event(evt="key", data="\x12", raw=bytearray(b"\x12")),  # Ctrl-R
+                Event(evt="key", data="h", raw=bytearray(b"h")),
+                Event(evt="key", data="\x1b", raw=bytearray(b"\x1b")),
+            ],
+        )
+        reader, _ = self._run_vi(events_insert_path)
+        self.assertTrue(reader.editor_mode.is_insert())
+
+        events_normal_path = itertools.chain(
+            code_to_events("hello"),
+            [
+                Event(evt="key", data="\x1b", raw=bytearray(b"\x1b")),
+                Event(evt="key", data="\x12", raw=bytearray(b"\x12")),
+                Event(evt="key", data="\x1b", raw=bytearray(b"\x1b")),
+            ],
+        )
+        reader, _ = self._run_vi(events_normal_path)
+        self.assertTrue(reader.editor_mode.is_normal())
+
+
+@force_not_colorized_test_class
+class TestHistoricalReaderBindings(TestCase):
+    def test_meta_bindings_present_only_in_emacs_mode(self):
+        console = prepare_console(iter(()))
+        reader = prepare_reader(console)
+        emacs_keymap = dict(reader.collect_keymap())
+        self.assertIn(r"\M-r", emacs_keymap)
+        self.assertIn(r"\x1b[6~", emacs_keymap)
+
+        reader.editor_config.use_vi_mode = True
+        reader.enter_insert_mode()
+        vi_keymap = dict(reader.collect_keymap())
+        self.assertNotIn(r"\M-r", vi_keymap)
+        self.assertNotIn(r"\x1b[6~", vi_keymap)
+        self.assertIn(r"\C-r", vi_keymap)
+
+    def test_prepare_sets_console_vi_hint(self):
+        console = prepare_console(iter(()))
+        console.set_prefer_vi_escape = MagicMock()
+        reader = prepare_reader(console)
+        reader.editor_config.use_vi_mode = True
+        reader.prepare()
+        console.set_prefer_vi_escape.assert_called_with(True)
