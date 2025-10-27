@@ -8,19 +8,10 @@ from test.support import force_colorized_test_class, force_not_colorized_test_cl
 
 from .support import handle_all_events, handle_events_narrow_console
 from .support import ScreenEqualMixin, code_to_events
-from .support import prepare_reader, prepare_console
+from .support import prepare_reader, prepare_console, prepare_vi_reader
 from _pyrepl.console import Event
 from _pyrepl.reader import Reader
 from _colorize import default_theme
-
-
-def prepare_vi_reader(console, **kwargs):
-    reader = prepare_reader(console, **kwargs)
-    reader.editor_config.use_vi_mode = True
-    reader.enter_normal_mode()
-    reader.enter_insert_mode()
-    return reader
-
 
 overrides = {"reset": "z", "soft_keyword": "K"}
 colors = {overrides.get(k, k[0].lower()): v for k, v in default_theme.syntax.items()}
@@ -559,22 +550,6 @@ class TestReaderInColor(ScreenEqualMixin, TestCase):
         self.assert_screen_equal(reader, code, clean=True)
         self.maxDiff=None
         self.assert_screen_equal(reader, expected)
-
-    def test_vi_escape_switches_to_normal_mode(self):
-        events = itertools.chain(
-            code_to_events("hello"),
-            [
-                Event(evt="key", data="\x1b", raw=bytearray(b"\x1b")),
-                Event(evt="key", data="h", raw=bytearray(b"h")),
-            ],
-        )
-        reader, _ = handle_all_events(
-            events,
-            prepare_reader=prepare_vi_reader,
-        )
-        self.assertEqual(reader.get_unicode(), "hello")
-        self.assertTrue(reader.editor_mode.is_normal())
-        self.assertEqual(reader.pos, len("hello") - 1)
 
     def test_control_characters(self):
         code = 'flag = "🏳️‍🌈"'
