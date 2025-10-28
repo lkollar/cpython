@@ -183,6 +183,9 @@ vi_normal_keymap: tuple[tuple[KeySpec, CommandName], ...] = tuple(
         (r"I", "vi-insert-bol"),
         (r"o", "vi-open-below"),
         (r"O", "vi-open-above"),
+        (r"d", "vi-operator-delete"),
+        (r"c", "vi-operator-change"),
+        (r"y", "vi-operator-yank"),
 
         # Special keys still work in normal mode
         (r"\<left>", "left"),
@@ -214,6 +217,15 @@ vi_normal_keymap: tuple[tuple[KeySpec, CommandName], ...] = tuple(
         # ESC in normal mode does nothing (could beep or cancel pending operations)
         (r"\<escape>", "invalid-key"),
     ]
+)
+
+VI_OPERATOR_SUPPORTED_MOTIONS: tuple[type[commands.Command], ...] = (
+    commands.left,
+    commands.right,
+    commands.beginning_of_line,
+    commands.end_of_line,
+    commands.forward_word,
+    commands.backward_word,
 )
 
 
@@ -302,6 +314,9 @@ class Reader:
     threading_hook: Callback | None = None
     editor_config: EditorConfig = field(default_factory=EditorConfig)
     editor_mode: EditorMode = field(default_factory=EditorMode)
+    pending_vi_operator: str | None = None
+    pending_vi_operator_count: int | None = None
+    pending_vi_operator_command: type[commands.Command] | None = None
 
     ## cached metadata to speed up screen refreshes
     @dataclass
@@ -764,6 +779,65 @@ class Reader:
         else:
             return  # nothing to do
 
+        if (
+            self.editor_config.use_vi_mode
+            and self.editor_mode.is_normal()
+            and self.pending_vi_operator
+        ):
+            if command_type in VI_OPERATOR_SUPPORTED_MOTIONS:
+                command, last_override = self._handle_vi_operator_motion(
+                    command_type, cmd
+                )
+                self.after_command(command)
+
+                if self.dirty:
+                    self.refresh()
+                else:
+                    self.update_cursor()
+
+                if last_override is not None:
+                    self.last_command = last_override
+                elif command_type is not commands.digit_arg:
+                    self.last_command = command_type
+
+                self.finished = bool(command.finish)
+                if self.finished:
+                    self.console.finish()
+                    self.finish()
+                return
+            if command_type is commands.digit_arg:
+                # Counts following the operator apply to the motion.
+                pass
+            elif (
+                self.pending_vi_operator_command is command_type
+                and self.pending_vi_operator is not None
+            ):
+                # Repeat operator (e.g. `dd`).
+                command, last_override = self._handle_vi_operator_linewise(
+                    command_type
+                )
+                self.after_command(command)
+
+                if self.dirty:
+                    self.refresh()
+                else:
+                    self.update_cursor()
+
+                if last_override is not None:
+                    self.last_command = last_override
+                else:
+                    self.last_command = command_type
+
+                self.finished = bool(command.finish)
+                if self.finished:
+                    self.console.finish()
+                    self.finish()
+                return
+            else:
+                self.reset_vi_operator()
+                self.error("motion expected")
+                return
+
         command = command_type(self, *cmd)  # type: ignore[arg-type]
         command.do()
 
@@ -873,10 +947,132 @@ class Reader:
         """Return the current buffer as a unicode string."""
         return "".join(self.buffer)
 
+    def start_vi_operator(
+        self, operator: str, operator_command: type[commands.Command]
+    ) -> None:
+        self.pending_vi_operator = operator
+        # capture any numeric prefix supplied so far; will be consumed later
+        self.pending_vi_operator_count = self.arg
+        self.pending_vi_operator_command = operator_command
+        self.arg = None
+        self.dirty = True
+
+    def reset_vi_operator(self) -> None:
+        self.pending_vi_operator = None
+        self.pending_vi_operator_count = None
+        self.pending_vi_operator_command = None
+
+    def _handle_vi_operator_motion(
+        self,
+        command_type: type[commands.Command],
+        cmd: tuple[str, list[str]],
+    ) -> tuple[commands.Command, type[commands.Command] | None]:
+        operator = self.pending_vi_operator
+        if operator is None:
+            command = command_type(self, *cmd)  # type: ignore[arg-type]
+            return command, None
+
+        start_pos = self.pos
+        operator_count = self.pending_vi_operator_count or 1
+        motion_count = self.arg if self.arg is not None else 1
+        total_count = operator_count * motion_count
+        if total_count <= 0:
+            total_count = 1
+
+        self.arg = total_count
+        command = command_type(self, *cmd)  # type: ignore[arg-type]
+        command.do()
+        end_pos = self.pos
+
+        pending_class = self.pending_vi_operator_command
+        last_override: type[commands.Command] | None = None
+
+        if end_pos == start_pos:
+            self.error("motion failed")
+        else:
+            range_start, range_end = sorted((start_pos, end_pos))
+            self.pos = range_start
+            if self._apply_vi_operator(operator, range_start, range_end):
+                if pending_class is not None:
+                    last_override = pending_class
+
+        self.reset_vi_operator()
+        return command, last_override
+
+    def _handle_vi_operator_linewise(
+        self, command_type: type[commands.Command]
+    ) -> tuple[commands.Command, type[commands.Command] | None]:
+        operator = self.pending_vi_operator
+        if operator is None:
+            command = command_type(self, command_type.__name__, [])
+            return command, None
+
+        count = self.pending_vi_operator_count or 1
+        if count <= 0:
+            count = 1
+
+        start = self.bol()
+        end = start
+        remaining = count
+        buf = self.buffer
+
+        while remaining > 0 and end < len(buf):
+            while end < len(buf) and buf[end] != "\n":
+                end += 1
+            if end < len(buf):
+                end += 1  # include newline
+            remaining -= 1
+
+        if remaining > 0 and end <= len(buf):
+            end = len(buf)
+
+        pending_class = self.pending_vi_operator_command
+        last_override: type[commands.Command] | None = None
+
+        if start == end:
+            self.console.beep()
+        else:
+            if self._apply_vi_operator(operator, start, end):
+                self.pos = start
+                if pending_class is not None:
+                    last_override = pending_class
+
+        self.reset_vi_operator()
+        # Use a no-op command; linewise operators don't have a direct command execution here.
+        command = command_type(self, command_type.__name__, [])
+        return command, last_override
+
+    def _apply_vi_operator(self, operator: str, start: int, end: int) -> bool:
+        start, end = sorted((start, end))
+
+        if operator in {"delete", "change"}:
+            prev_last_command = self.last_command
+            self.last_command = None
+            helper = commands.kill_line(self, "", [])
+            if start != end:
+                helper.kill_range(start, end)
+            self.last_command = prev_last_command
+            if operator == "change":
+                self.enter_insert_mode()
+            return True
+
+        if operator == "yank":
+            text = self.buffer[start:end]
+            if not text:
+                self.console.beep()
+                return False
+            # store a copy on the kill ring
+            self.kill_ring.append(text.copy())
+            self.pos = start
+            return True
+
+        return False
+
     def enter_insert_mode(self) -> None:
         if self.editor_mode.is_insert():
             return
 
+        self.reset_vi_operator()
         self.editor_mode.mode = Mode.INSERT
 
         # Switch translator to insert mode keymap
@@ -891,6 +1087,7 @@ class Reader:
         if self.editor_mode.is_normal():
             return
 
+        self.reset_vi_operator()
         self.editor_mode.mode = Mode.NORMAL
 
         # Switch translator to normal mode keymap

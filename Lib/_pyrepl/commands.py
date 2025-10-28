@@ -556,3 +556,18 @@ class vi_open_above(Command):
         self.reader.insert('\n')
         self.reader.pos -= 1
         self.reader.enter_insert_mode()
+
+
+class vi_operator_delete(KillCommand):
+    def do(self) -> None:
+        self.reader.start_vi_operator("delete", type(self))
+
+
+class vi_operator_change(KillCommand):
+    def do(self) -> None:
+        self.reader.start_vi_operator("change", type(self))
+
+
+class vi_operator_yank(YankCommand):
+    def do(self) -> None:
+        self.reader.start_vi_operator("yank", type(self))
