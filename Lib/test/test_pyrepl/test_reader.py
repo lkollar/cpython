@@ -645,8 +645,30 @@ class TestViMode(TestCase):
         reader, _ = self._run_vi(events, prepare_with_prompts)
         normal_prompt = reader.get_prompt(0, True)
         self.assertTrue(normal_prompt.startswith("[N] "))
-        insert_prompt = reader.get_prompt(0, False)
-        self.assertFalse(insert_prompt.startswith("[N] "))
+        off_cursor_prompt = reader.get_prompt(0, False)
+        self.assertTrue(off_cursor_prompt.startswith("[N] "))
+
+    def test_prompt_indicator_persists_in_multiline(self):
+        def prepare_with_prompts(console, **kwargs):
+            reader = prepare_vi_reader(console, **kwargs)
+            reader.get_prompt = Reader.get_prompt.__get__(reader, Reader)
+            reader.can_colorize = False
+            reader.ps1 = ">>> "
+            reader.ps2 = reader.ps3 = "... "
+            reader.ps4 = ""
+            reader.paste_mode = False
+            return reader
+
+        reader, _ = self._run_vi(iter(()), prepare_with_prompts)
+        reader.insert("line1\n")
+        reader.calc_screen()
+        # First line keeps the indicator with the primary prompt
+        prompt_line0 = reader.get_prompt(0, False)
+        self.assertTrue(prompt_line0.startswith("[I] "))
+        prompt_line1 = reader.get_prompt(1, True)
+        self.assertFalse(prompt_line1.startswith("[I] "))
+        prompt_line1_off_cursor = reader.get_prompt(1, False)
+        self.assertFalse(prompt_line1_off_cursor.startswith("[I] "))
 
     def test_mode_resets_to_insert_on_prepare(self):
         events = itertools.chain(
