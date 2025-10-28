@@ -574,9 +574,15 @@ class Reader:
         elif self.paste_mode:
             prompt = "(paste) "
         elif "\n" in self.buffer:
+            newline_count = self.buffer.count("\n")
+            ends_with_newline = bool(self.buffer) and self.buffer[-1] == "\n"
             if lineno == 0:
-                prompt = self.ps2
-            elif self.ps4 and lineno == self.buffer.count("\n"):
+                prompt = self.ps1
+            elif lineno < newline_count:
+                prompt = self.ps3
+            elif ends_with_newline and lineno == newline_count:
+                prompt = self.ps3
+            elif self.ps4 and lineno == newline_count:
                 prompt = self.ps4
             else:
                 prompt = self.ps3
@@ -585,12 +591,12 @@ class Reader:
 
         if (
             self.editor_config.use_vi_mode
-            and cursor_on_line
             and prompt == self.ps1
+            and lineno == 0
         ):
-            in_insert = self.editor_mode.is_insert()
-            indicator = "[I] " if in_insert else "[N] "
-            prompt = f"{indicator}{prompt}"
+            indicator = "[I] " if self.editor_mode.is_insert() else "[N] "
+            if not prompt.startswith(indicator):
+                prompt = f"{indicator}{prompt}"
 
         if self.can_colorize:
             t = THEME()
