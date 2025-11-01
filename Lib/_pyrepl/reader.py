@@ -589,6 +589,15 @@ class Reader:
         else:
             prompt = self.ps1
 
+        if (
+            self.editor_config.use_vi_mode
+            and prompt == self.ps1
+            and lineno == 0
+        ):
+            indicator = "[I] " if self.editor_mode.is_insert() else "[N] "
+            if not prompt.startswith(indicator):
+                prompt = f"{indicator}{prompt}"
+
         if self.can_colorize:
             t = THEME()
             prompt = f"{t.prompt}{prompt}{t.reset}"
