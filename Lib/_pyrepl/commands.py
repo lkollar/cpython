@@ -571,3 +571,13 @@ class vi_operator_change(KillCommand):
 class vi_operator_yank(YankCommand):
     def do(self) -> None:
         self.reader.start_vi_operator("yank", type(self))
+
+
+class vi_paste_after(Command):
+    def do(self) -> None:
+        self.reader.vi_paste(after=True)
+
+
+class vi_paste_before(Command):
+    def do(self) -> None:
+        self.reader.vi_paste(after=False)

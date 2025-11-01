@@ -706,6 +706,33 @@ class TestViMode(TestCase):
         reader, _ = self._run_vi(events_normal_path)
         self.assertTrue(reader.editor_mode.is_normal())
 
+    def test_vi_paste_linewise(self):
+        events = itertools.chain(
+            code_to_events("first\nsecond\n"),
+            [Event(evt="key", data="\x1b", raw=bytearray(b"\x1b"))],
+            code_to_events("kkddp"),
+        )
+        reader, _ = self._run_vi(events)
+        self.assertEqual(reader.get_unicode(), "second\nfirst\n")
+
+    def test_vi_paste_before_line(self):
+        events = itertools.chain(
+            code_to_events("first\nsecond\n"),
+            [Event(evt="key", data="\x1b", raw=bytearray(b"\x1b"))],
+            code_to_events("kkddP"),
+        )
+        reader, _ = self._run_vi(events)
+        self.assertEqual(reader.get_unicode(), "first\nsecond\n")
+
+    def test_vi_paste_charwise(self):
+        events = itertools.chain(
+            code_to_events("hello"),
+            [Event(evt="key", data="\x1b", raw=bytearray(b"\x1b"))],
+            code_to_events("0ylp"),
+        )
+        reader, _ = self._run_vi(events)
+        self.assertEqual(reader.get_unicode(), "hhello")
+
 
 @force_not_colorized_test_class
 class TestHistoricalReaderBindings(TestCase):

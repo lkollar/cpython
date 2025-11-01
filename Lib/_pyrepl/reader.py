@@ -186,6 +186,8 @@ vi_normal_keymap: tuple[tuple[KeySpec, CommandName], ...] = tuple(
         (r"d", "vi-operator-delete"),
         (r"c", "vi-operator-change"),
         (r"y", "vi-operator-yank"),
+        (r"p", "vi-paste-after"),
+        (r"P", "vi-paste-before"),
 
         # Special keys still work in normal mode
         (r"\<left>", "left"),
@@ -962,6 +964,46 @@ class Reader:
         self.pending_vi_operator_count = None
         self.pending_vi_operator_command = None
 
+    def vi_paste(self, after: bool) -> None:
+        if not self.kill_ring:
+            self.error("nothing to paste")
+            return
+
+        text = self.kill_ring[-1]
+        if not text:
+            self.console.beep()
+            return
+
+        text_copy = text.copy()
+        is_linewise = bool(text_copy) and text_copy[-1] == "\n"
+
+        if is_linewise:
+            if after:
+                insert_pos = self.eol()
+                if insert_pos < len(self.buffer):
+                    insert_pos += 1
+            else:
+                insert_pos = self.bol()
+        else:
+            insert_pos = self.pos
+            if after and insert_pos < len(self.buffer):
+                insert_pos += 1
+
+        self.buffer[insert_pos:insert_pos] = text_copy
+
+        if is_linewise:
+            self.pos = insert_pos
+        else:
+            self.pos = insert_pos + len(text_copy) - 1
+
+        if self.pos < 0:
+            self.pos = 0
+        if self.pos > len(self.buffer):
+            self.pos = len(self.buffer)
+
+        self.dirty = True
+        self.reset_vi_operator()
+
     def _handle_vi_operator_motion(
         self,
         command_type: type[commands.Command],
@@ -1011,20 +1053,38 @@ class Reader:
         if count <= 0:
             count = 1
 
-        start = self.bol()
+        buf = self.buffer
+        buf_len = len(buf)
+        if buf_len == 0:
+            self.console.beep()
+            self.reset_vi_operator()
+            command = command_type(self, command_type.__name__, [])
+            return command, None
+
+        cursor = self.pos
+        if cursor >= buf_len:
+            cursor = buf_len - 1
+        if cursor < 0:
+            cursor = 0
+        if buf[cursor] == "\n" and cursor > 0:
+            cursor -= 1
+
+        start = cursor
+        while start > 0 and buf[start - 1] != "\n":
+            start -= 1
+
         end = start
         remaining = count
-        buf = self.buffer
 
-        while remaining > 0 and end < len(buf):
-            while end < len(buf) and buf[end] != "\n":
+        while remaining > 0 and end < buf_len:
+            while end < buf_len and buf[end] != "\n":
                 end += 1
-            if end < len(buf):
+            if end < buf_len:
                 end += 1  # include newline
             remaining -= 1
 
-        if remaining > 0 and end <= len(buf):
-            end = len(buf)
+        if remaining > 0 and end <= buf_len:
+            end = buf_len
 
         pending_class = self.pending_vi_operator_command
         last_override: type[commands.Command] | None = None
