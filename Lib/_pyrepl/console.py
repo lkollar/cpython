@@ -152,10 +152,6 @@ class Console(ABC):
     @abstractmethod
     def repaint(self) -> None: ...
 
-    def set_prefer_vi_escape(self, enabled: bool) -> None:
-        """Optional hint for consoles that can favor standalone ESC semantics."""
-        return None
-
 
 class InteractiveColoredConsole(code.InteractiveConsole):
     STATEMENT_FAILED = object()

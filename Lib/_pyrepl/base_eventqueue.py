@@ -31,6 +31,13 @@ from .console import Event
 from .trace import trace
 
 class BaseEventQueue:
+    # Timeout for escape sequence disambiguation (milliseconds).
+    # When an ESC byte is received, it could be either a standalone ESC key
+    # or the start of an escape sequence (arrow keys, etc.). This timeout
+    # determines how long to wait for follow-up bytes before treating the
+    # ESC as standalone. 50ms matches Vim's default ttimeoutlen.
+    _ESCAPE_TIMEOUT_MS = 50
+
     def __init__(self, encoding: str, keymap_dict: dict[bytes, str]) -> None:
         self.compiled_keymap = keymap.compile_keymap(keymap_dict)
         self.keymap = self.compiled_keymap
@@ -38,6 +45,7 @@ class BaseEventQueue:
         self.encoding = encoding
         self.events: deque[Event] = deque()
         self.buf = bytearray()
+        self._pending_escape_deadline: float | None = None
 
     def get(self) -> Event | None:
         """
@@ -69,6 +77,62 @@ class BaseEventQueue:
         trace('added event {event}', event=event)
         self.events.append(event)
 
+    def has_pending_escape_sequence(self) -> bool:
+        """
+        Check if there's a potential escape sequence waiting for more input.
+
+        Returns True if we have exactly one byte (ESC) in the buffer and
+        we're in the middle of keymap navigation, indicating we're waiting
+        to see if more bytes will arrive to complete an escape sequence.
+        """
+        return (
+            len(self.buf) == 1
+            and self.buf[0] == 27  # ESC byte
+            and self.keymap is not self.compiled_keymap
+        )
+
+    def should_emit_standalone_escape(self, current_time_ms: float) -> bool:
+        """
+        Check if a pending ESC should be emitted as a standalone escape key.
+
+        Args:
+            current_time_ms: Current timestamp in milliseconds.
+
+        Returns:
+            True if there's a pending ESC and the timeout has expired.
+        """
+        if not self.has_pending_escape_sequence():
+            return False
+
+        if self._pending_escape_deadline is None:
+            # First time checking - set the deadline
+            self._pending_escape_deadline = current_time_ms + self._ESCAPE_TIMEOUT_MS
+            return False
+
+        # Check if the deadline has passed
+        return current_time_ms >= self._pending_escape_deadline
+
+    def emit_standalone_escape(self) -> None:
+        """
+        Emit the buffered ESC byte as a standalone escape key event.
+
+        This is called when the timeout expires and we've determined that
+        the ESC was not the start of an escape sequence.
+        """
+        # Reset keymap to root
+        self.keymap = self.compiled_keymap
+
+        # Create standalone ESC event
+        self.insert(Event('key', '\033', b'\033'))
+
+        # Re-process any remaining buffered bytes (shouldn't be any, but be safe)
+        remaining = self.flush_buf()[1:]
+        for byte in remaining:
+            self.push(byte)
+
+        # Clear the deadline
+        self._pending_escape_deadline = None
+
     def push(self, char: int | bytes) -> None:
         """
         Processes a character by updating the buffer and handling special key mappings.
@@ -77,6 +141,11 @@ class BaseEventQueue:
         ord_char = char if isinstance(char, int) else ord(char)
         char = ord_char.to_bytes()
         self.buf.append(ord_char)
+
+        # Clear escape deadline when new bytes arrive - we're making progress
+        # on completing a sequence
+        if self._pending_escape_deadline is not None:
+            self._pending_escape_deadline = None
 
         if char in self.keymap:
             if self.keymap is self.compiled_keymap:

@@ -690,8 +690,6 @@ class Reader:
         write to the console in between the calls to prepare and
         restore."""
         try:
-            if hasattr(self.console, "set_prefer_vi_escape"):
-                self.console.set_prefer_vi_escape(self.editor_config.use_vi_mode)
             self.console.prepare()
             self.arg = None
             self.finished = False
