@@ -445,6 +445,19 @@ pydoc
   (Contributed by Serhiy Storchaka in :gh:`153906`.)
 
 
+profiling
+---------
+
+* Add an extension interface for third-party
+  :mod:`profiling.sampling` collectors. The new ``--collector`` option loads
+  an explicit ``module:factory`` reference for process sampling or binary
+  replay.
+  Factories receive :class:`~profiling.sampling.CollectorContext`, and
+  stack-based formats can subclass
+  :class:`~profiling.sampling.StackTraceCollector`.
+  (Contributed by László Kiss Kollár in :gh:`150327`.)
+
+
 re
 --
 

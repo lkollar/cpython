@@ -1303,6 +1303,212 @@ A typical workflow::
    python -m profiling.sampling replay --heatmap -o heatmap profile.bin
 
 
+External collectors
+===================
+
+Third-party packages can add output formats with the
+:option:`--collector` option. Its argument is an explicit
+``module:factory`` reference::
+
+   python -m profiling.sampling run \
+       --collector mypackage.trace:create -o profile.json script.py
+   python -m profiling.sampling attach \
+       --collector mypackage.trace:create -o profile.json 12345
+   python -m profiling.sampling replay \
+       --collector mypackage.trace:create -o profile.json profile.bin
+
+The factory is imported before a ``run`` target is started, then called once
+the target process ID, or binary replay header, is available. It receives a
+frozen :class:`CollectorContext` and must return a :class:`Collector`.
+Using :class:`StackTraceCollector` is recommended for stack-based formats: it
+handles synchronous and asynchronous stack traversal, internal-frame
+filtering, idle-thread filtering, and repeated-sample batching.
+
+The collector owns its output path. It must set ``output_file`` to a
+non-empty path during construction. When :option:`-o` is present, that path
+must identify the same normalized absolute path; otherwise, the factory
+chooses the default. The profiler never changes this attribute. After
+sampling, it passes the path to :meth:`Collector.export` exactly once. An
+incremental collector can open the path lazily on its first sample and use
+``export()`` only to flush and close it. Deferring resource acquisition until
+after construction also lets the profiler validate the collector first.
+
+The lifecycle is:
+
+#. Resolve the explicit factory and validate that it is callable.
+#. Construct and validate the collector before sampling.
+#. Call :meth:`Collector.collect` for successful samples and
+   :meth:`Collector.collect_failed_sample` for recoverable sampling failures.
+#. Call :meth:`Collector.export` once to finalize the output.
+
+Exceptions raised by a factory or collector are reported with their original
+cause. A failed factory for ``run`` does not leave the target process running.
+The interactive :option:`--live` collector cannot be combined with an
+external collector.
+
+Collector factories do not receive command-line parser objects, and external
+collectors cannot add options to this command. Packages can provide multiple
+factory functions, use environment variables, or read their own configuration
+files. This keeps the profiler's command-line interface independent of
+third-party packages.
+
+The following reporter writes timestamped stack samples as JSON. It imports
+only the public extension interface::
+
+   import json
+   from profiling.sampling import CollectorContext, StackTraceCollector
+
+   class JsonTraceCollector(StackTraceCollector):
+       def __init__(self, context):
+           super().__init__(
+               skip_idle=context.sampling_mode not in (None, "wall")
+           )
+           suffix = (
+               "replay" if context.command == "replay" else context.target_pid
+           )
+           self.output_file = (
+               context.requested_output_file or f"trace_{suffix}.json"
+           )
+           self.samples = []
+
+       def process_frames(
+           self, frames, thread_id, weight=1, timestamps_us=None
+       ):
+           functions = [frame[2] for frame in reversed(frames)]
+           for timestamp in timestamps_us or (None,) * weight:
+               self.samples.append({
+                   "timestamp_us": timestamp,
+                   "thread_id": thread_id,
+                   "functions": functions,
+               })
+
+       def export(self, filename):
+           with open(filename, "w", encoding="utf-8") as output:
+               json.dump(self.samples, output)
+           return bool(self.samples)
+
+   def create(context: CollectorContext):
+       return JsonTraceCollector(context)
+
+``frames`` is ordered from the innermost frame to the outermost. Each frame
+is a four-item sequence containing ``filename``, source location, function
+name, and opcode. The source location is ``None``, an integer line number, or
+a ``(line, end_line, column, end_column)`` tuple. ``timestamps_us`` contains
+one or more monotonic timestamps for identical batched samples; ``weight`` is
+its logical sample count.
+
+
+.. class:: CollectorContext
+
+   Immutable construction settings passed to an external collector factory.
+
+   .. versionadded:: 3.16
+
+   .. attribute:: command
+
+      The command creating the collector: ``"run"``, ``"attach"``, or
+      ``"replay"``.
+
+   .. attribute:: target_pid
+
+      The sampled process ID for ``run`` and ``attach``; ``None`` for
+      ``replay``.
+
+   .. attribute:: input_file
+
+      The binary profile path for ``replay``; ``None`` for ``run`` and
+      ``attach``.
+
+   .. attribute:: requested_output_file
+
+      The :option:`-o` value, or ``None`` when the factory must choose a
+      default.
+
+   .. attribute:: sample_interval_usec
+
+      The positive sampling interval in microseconds.
+
+   .. attribute:: duration_sec
+
+      The requested duration as a :class:`float`, or ``None``.
+
+   .. attribute:: sampling_mode
+
+      The sampling mode: ``"wall"``, ``"cpu"``, ``"gil"``, or
+      ``"exception"``.
+
+   .. attribute:: all_threads
+
+      Whether all threads are sampled.
+
+   .. attribute:: async_aware
+
+      The asynchronous stack mode: ``"running"``, ``"all"``, or ``None``.
+
+   .. attribute:: native
+   .. attribute:: gc
+   .. attribute:: opcodes
+
+      Whether native frames, garbage collection frames, or opcode details,
+      respectively, were requested.
+
+   .. attribute:: blocking
+
+      Whether the target is paused while its stack is read.
+
+   During replay, ``sample_interval_usec`` comes from the binary profile.
+   Settings not recorded by that format, including ``target_pid``,
+   ``sampling_mode``, and collection flags, are ``None`` rather than inferred
+   from command-line defaults. Consequently, the example above does not
+   filter idle stacks during replay.
+
+
+.. class:: Collector
+
+   Base class for sampling collectors. External collectors implement
+   :meth:`collect` and :meth:`export`, set ``output_file`` during construction,
+   and may override :meth:`collect_failed_sample`.
+
+   .. attribute:: output_file
+
+      The non-empty path passed to :meth:`export`. External collectors must
+      set this attribute during construction. When :option:`-o` is present,
+      both paths must identify the same normalized absolute path.
+
+   .. method:: collect(stack_frames, timestamps_us=None)
+
+      Consume one stack snapshot. Advanced collectors can process the raw
+      snapshot directly. Stack-based formats should normally subclass
+      :class:`StackTraceCollector` instead.
+
+   .. method:: collect_failed_sample()
+
+      Record a recoverable sampling attempt that produced no snapshot. A
+      collector can override this method to count failed attempts.
+
+   .. method:: export(filename)
+
+      Finalize output at ``filename`` and return ``True`` when usable output was
+      generated. For an external collector, ``filename`` is its validated
+      ``output_file``.
+
+
+.. class:: StackTraceCollector(*, skip_idle=False)
+
+   A :class:`Collector` that implements stack traversal and batching. Its
+   constructor accepts the keyword-only ``skip_idle`` argument. When true,
+   stacks for idle threads are omitted. The sampling interval is not needed
+   for traversal; formats that encode it can read it from
+   ``CollectorContext.sample_interval_usec``.
+
+   .. versionadded:: 3.16
+
+   .. method:: process_frames(frames, thread_id, weight=1, timestamps_us=None)
+
+      Process one filtered stack. Subclasses override this method instead of
+      :meth:`Collector.collect`.
+
+
 Live mode
 =========
 
@@ -1600,7 +1806,7 @@ Sampling options
    Gather bytecode opcode information for instruction-level profiling. Shows
    which bytecode instructions are executing, including specializations.
    Compatible with ``--live``, ``--flamegraph``, ``--heatmap``, and ``--gecko``
-   formats only.
+   formats.
 
 .. option:: --subprocesses
 
@@ -1663,6 +1869,14 @@ Output options
 
    Generate high-performance binary format for later conversion with the
    ``replay`` command.
+
+.. option:: --collector <module:factory>
+
+   Use a third-party collector returned by the explicit factory reference.
+   This is mutually exclusive with built-in output format options. See
+   `External collectors`_.
+
+   .. versionadded:: 3.16
 
 .. option:: --compression <type>
 
