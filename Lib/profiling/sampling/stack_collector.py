@@ -7,6 +7,7 @@ import linecache
 import os
 import sys
 import sysconfig
+from abc import abstractmethod
 
 from ._css_utils import get_combined_css
 from .collector import Collector, extract_lineno
@@ -16,27 +17,32 @@ from .module_utils import extract_module_name, get_python_path_info
 
 
 class StackTraceCollector(Collector):
+    """Collector base class that traverses and filters sampled stacks."""
+
     aggregating = True
 
-    def __init__(self, sample_interval_usec, *, skip_idle=False):
-        self.sample_interval_usec = sample_interval_usec
+    def __init__(self, *, skip_idle=False):
         self.skip_idle = skip_idle
 
     def collect(self, stack_frames, timestamps_us=None):
         weight = len(timestamps_us) if timestamps_us else 1
         for frames, thread_id in self._iter_stacks(stack_frames, skip_idle=self.skip_idle):
-            self.process_frames(frames, thread_id, weight=weight)
+            self.process_frames(
+                frames, thread_id, weight=weight, timestamps_us=timestamps_us
+            )
 
-    def process_frames(self, frames, thread_id, weight=1):
-        pass
+    @abstractmethod
+    def process_frames(self, frames, thread_id, weight=1, timestamps_us=None):
+        """Process one filtered stack and its sample timestamps."""
 
 
 class CollapsedStackCollector(StackTraceCollector):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, sample_interval_usec, *, skip_idle=False):
+        super().__init__(skip_idle=skip_idle)
+        self.sample_interval_usec = sample_interval_usec
         self.stack_counter = collections.Counter()
 
-    def process_frames(self, frames, thread_id, weight=1):
+    def process_frames(self, frames, thread_id, weight=1, timestamps_us=None):
         # Extract only (filename, lineno, funcname) - opcode not needed for collapsed stacks
         # frame is (filename, location, funcname, opcode)
         call_tree = tuple(
@@ -68,8 +74,9 @@ class CollapsedStackCollector(StackTraceCollector):
 
 
 class FlamegraphCollector(StackTraceCollector):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, sample_interval_usec, *, skip_idle=False):
+        super().__init__(skip_idle=skip_idle)
+        self.sample_interval_usec = sample_interval_usec
         self.stats = {"sample_interval_usec": self.sample_interval_usec}
         self._root = {
             "samples": 0,
@@ -397,7 +404,7 @@ class FlamegraphCollector(StackTraceCollector):
             "opcode_mapping": opcode_mapping
         }
 
-    def process_frames(self, frames, thread_id, weight=1):
+    def process_frames(self, frames, thread_id, weight=1, timestamps_us=None):
         """Process stack frames into flamegraph tree structure.
 
         Args:

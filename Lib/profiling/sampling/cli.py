@@ -4,6 +4,7 @@ import argparse
 import importlib.util
 import locale
 import os
+import pkgutil
 import re
 import selectors
 import socket
@@ -23,6 +24,7 @@ from .gecko_collector import GeckoCollector
 from .jsonl_collector import JsonlCollector
 from .binary_collector import BinaryCollector
 from .binary_reader import BinaryReader
+from .collector import Collector, CollectorContext
 from .constants import (
     MICROSECONDS_PER_SECOND,
     PROFILING_MODE_ALL,
@@ -170,7 +172,9 @@ def _build_child_profiler_args(args):
         child_args.extend(["--mode", mode])
 
     # Format options (skip pstats as it's the default)
-    if args.format == "diff_flamegraph":
+    if getattr(args, "collector", None):
+        child_args.extend(["--collector", args.collector])
+    elif args.format == "diff_flamegraph":
         child_args.extend(["--diff-flamegraph", args.diff_baseline])
     elif args.format != "pstats":
         child_args.append(f"--{args.format}")
@@ -191,6 +195,9 @@ def _build_output_pattern(args):
             return f"{base}_{{pid}}{ext}"
         else:
             return f"{args.outfile}_{{pid}}"
+    if getattr(args, "collector", None):
+        # Let each external factory choose its own default output.
+        return None
     else:
         # Use default pattern based on format (consistent _ separator)
         extension = FORMAT_EXTENSIONS.get(args.format, "txt")
@@ -456,6 +463,12 @@ def _add_format_options(parser, include_compression=True, include_binary=True):
     output_group = parser.add_argument_group("Output options")
     format_group = output_group.add_mutually_exclusive_group()
     format_group.add_argument(
+        "--collector",
+        dest="collector",
+        metavar="MODULE:FACTORY",
+        help="Load an external collector factory",
+    )
+    format_group.add_argument(
         "--pstats",
         action="store_const",
         const="pstats",
@@ -685,6 +698,113 @@ def _create_collector(format_type, sample_interval_usec, skip_idle, opcodes=Fals
     return collector_class(sample_interval_usec, skip_idle=skip_idle)
 
 
+def _resolve_collector_factory(spec):
+    """Resolve an explicit ``module:factory`` external collector spec."""
+    if not isinstance(spec, str) or spec.count(":") != 1:
+        raise ValueError(
+            f"Invalid collector spec {spec!r}; expected module:factory"
+        )
+    try:
+        factory = pkgutil.resolve_name(spec, strict=True)
+    except (ValueError, ImportError, AttributeError) as exc:
+        raise ValueError(f"Could not load collector {spec!r}: {exc}") from exc
+    if not callable(factory):
+        raise TypeError(f"Collector factory {spec!r} is not callable")
+    return factory
+
+
+def _collector_context(command, args, *, sample_interval_usec, target_pid=None,
+                       input_file=None):
+    replay = command == "replay"
+    return CollectorContext(
+        command=command,
+        target_pid=target_pid,
+        input_file=input_file,
+        requested_output_file=args.outfile,
+        sample_interval_usec=sample_interval_usec,
+        duration_sec=(
+            None if replay or getattr(args, "duration", None) is None
+            else float(args.duration)
+        ),
+        sampling_mode=None if replay else getattr(args, "mode", None),
+        all_threads=None if replay else getattr(args, "all_threads", None),
+        async_aware=(
+            getattr(args, "async_mode", None)
+            if getattr(args, "async_aware", False) else None
+        ) if not replay else None,
+        native=None if replay else getattr(args, "native", None),
+        gc=None if replay else getattr(args, "gc", None),
+        opcodes=None if replay else getattr(args, "opcodes", None),
+        blocking=None if replay else getattr(args, "blocking", None),
+    )
+
+
+def _make_external_collector(factory, context):
+    try:
+        collector = factory(context)
+    except Exception as exc:
+        raise RuntimeError(f"External collector factory failed: {exc}") from exc
+    if not isinstance(collector, Collector):
+        raise TypeError("External collector factory must return a Collector")
+
+    try:
+        output_file = collector.output_file
+    except AttributeError as exc:
+        raise TypeError(
+            "External collector must define a non-empty output_file"
+        ) from exc
+    if not isinstance(output_file, (str, os.PathLike)):
+        raise TypeError("External collector output_file must be a path")
+    try:
+        output_file = os.fspath(output_file)
+    except TypeError as exc:
+        raise TypeError("External collector output_file must be a path") from exc
+    if not isinstance(output_file, str) or not output_file:
+        raise ValueError("External collector output_file must be non-empty")
+    if context.requested_output_file is not None:
+        try:
+            requested = os.fspath(context.requested_output_file)
+        except TypeError as exc:
+            raise TypeError("--output must be a path") from exc
+        if not isinstance(requested, str):
+            raise TypeError("--output must be a string path")
+        requested = os.path.normcase(os.path.abspath(requested))
+        actual = os.path.normcase(os.path.abspath(output_file))
+        if requested != actual:
+            raise ValueError(
+                "External collector output_file does not match --output"
+            )
+    return collector
+
+
+def _create_selected_collector(args, command, *, sample_interval_usec,
+                               skip_idle=False, mode=None, output_file=None,
+                               target_pid=None, input_file=None):
+    """Create the selected built-in or external collector."""
+    if getattr(args, "collector", None):
+        context = _collector_context(
+            command, args, target_pid=target_pid, input_file=input_file,
+            sample_interval_usec=sample_interval_usec,
+        )
+        return _make_external_collector(args._collector_factory, context)
+
+    return _create_collector(
+        args.format, sample_interval_usec, skip_idle,
+        getattr(args, "opcodes", False), mode, output_file=output_file,
+        compression=getattr(args, "compression", "auto"),
+        diff_baseline=getattr(args, "diff_baseline", None),
+    )
+
+
+def _finalize_collector(collector, args, command, pid, mode):
+    """Export output according to the selected command."""
+    if getattr(args, "collector", None):
+        return collector.export(collector.output_file)
+    if command == "replay":
+        return _handle_replay_output(collector, args, pid)
+    return _handle_output(collector, args, pid, mode)
+
+
 def _generate_output_filename(format_type, pid):
     """Generate output filename based on format and PID.
 
@@ -758,11 +878,6 @@ def _replay_with_reader(args, reader):
         f"{'zstd' if info.get('compression_type', 0) == 1 else 'none'}"
     )
 
-    collector = _create_collector(
-        args.format, interval, skip_idle=False,
-        diff_baseline=args.diff_baseline
-    )
-
     def progress_callback(current, total):
         if total > 0:
             pct = current / total
@@ -775,36 +890,16 @@ def _replay_with_reader(args, reader):
                 flush=True,
             )
 
+    collector = _create_selected_collector(
+        args, "replay", sample_interval_usec=interval,
+        input_file=args.input_file,
+    )
+
     count = reader.replay_samples(collector, progress_callback)
     print()
-
-    if args.format == "pstats":
-        if args.outfile:
-            collector.export(args.outfile)
-        else:
-            sort_choice = (
-                args.sort if args.sort is not None else "nsamples"
-            )
-            limit = args.limit if args.limit is not None else 15
-            sort_mode = _sort_to_mode(sort_choice)
-            collector.print_stats(
-                sort_mode, limit, not args.no_summary,
-                PROFILING_MODE_WALL
-            )
-    else:
-        filename = (
-            args.outfile
-            or _generate_output_filename(args.format, os.getpid())
-        )
-        export_ok = collector.export(filename)
-
-        # Auto-open browser for HTML output if --browser flag is set
-        if (
-            export_ok
-            and args.format in BROWSER_COMPATIBLE_FORMATS
-            and getattr(args, 'browser', False)
-        ):
-            _open_in_browser(filename)
+    _finalize_collector(
+        collector, args, "replay", os.getpid(), PROFILING_MODE_WALL
+    )
 
     print(f"Replayed {count} samples")
 
@@ -857,6 +952,32 @@ def _handle_output(collector, args, pid, mode):
             _open_in_browser(filename)
 
 
+def _handle_replay_output(collector, args, pid):
+    if args.format == "pstats":
+        if args.outfile:
+            collector.export(args.outfile)
+        else:
+            sort_choice = (
+                args.sort if args.sort is not None else "nsamples"
+            )
+            limit = args.limit if args.limit is not None else 15
+            sort_mode = _sort_to_mode(sort_choice)
+            collector.print_stats(
+                sort_mode, limit, not args.no_summary,
+                PROFILING_MODE_WALL,
+            )
+        return
+
+    filename = args.outfile or _generate_output_filename(args.format, pid)
+    export_ok = collector.export(filename)
+    if (
+        export_ok
+        and args.format in BROWSER_COMPATIBLE_FORMATS
+        and getattr(args, "browser", False)
+    ):
+        _open_in_browser(filename)
+
+
 def _validate_args(args, parser):
     """Validate format-specific options and live mode requirements.
 
@@ -865,6 +986,26 @@ def _validate_args(args, parser):
         parser: ArgumentParser instance for error reporting
     """
     command = getattr(args, 'command', None)
+
+    external = bool(getattr(args, "collector", None))
+    if external:
+        if getattr(args, "live", False):
+            parser.error("--live is incompatible with --collector")
+        if getattr(args, "browser", False):
+            parser.error("--browser is incompatible with --collector")
+        if command == "replay":
+            issues = []
+            if args.sort is not None:
+                issues.append("--sort")
+            if args.limit is not None:
+                issues.append("--limit")
+            if args.no_summary:
+                issues.append("--no-summary")
+            if issues:
+                parser.error(
+                    f"Options {', '.join(issues)} are incompatible with --collector"
+                )
+            return
 
     if command == "replay":
         return
@@ -928,7 +1069,7 @@ def _validate_args(args, parser):
     # Live mode is incompatible with format options
     if hasattr(args, 'live') and args.live:
         if args.format != "pstats":
-            format_flag = f"--{args.format}"
+            format_flag = "--collector" if external else f"--{args.format}"
             parser.error(
                 f"--live is incompatible with {format_flag}. Live mode uses a TUI interface."
             )
@@ -958,13 +1099,17 @@ def _validate_args(args, parser):
 
     # Validate --opcodes is only used with compatible formats
     opcodes_compatible_formats = ("live", "gecko", "flamegraph", "diff_flamegraph", "heatmap", "binary")
-    if getattr(args, 'opcodes', False) and args.format not in opcodes_compatible_formats:
+    if (
+        getattr(args, 'opcodes', False)
+        and not external
+        and args.format not in opcodes_compatible_formats
+    ):
         parser.error(
             f"--opcodes is only compatible with {', '.join('--' + f for f in opcodes_compatible_formats)}."
         )
 
     # Validate pstats-specific options are only used with pstats format
-    if args.format != "pstats":
+    if external or args.format != "pstats":
         issues = []
         if args.sort is not None:
             issues.append("--sort")
@@ -974,7 +1119,7 @@ def _validate_args(args, parser):
             issues.append("--no-summary")
 
         if issues:
-            format_flag = f"--{args.format}"
+            format_flag = "--collector" if external else f"--{args.format}"
             parser.error(
                 f"Options {', '.join(issues)} are only valid with --pstats, not {format_flag}"
             )
@@ -1131,6 +1276,12 @@ Examples:
     # Validate arguments
     _validate_args(args, parser)
 
+    if getattr(args, "collector", None):
+        try:
+            args._collector_factory = _resolve_collector_factory(args.collector)
+        except (ValueError, TypeError) as exc:
+            parser.error(f"--collector: {exc}")
+
     # Command dispatch table
     command_handlers = {
         "run": _handle_run,
@@ -1157,9 +1308,10 @@ def _handle_attach(args):
         return
 
     # Use PROFILING_MODE_ALL for gecko format
+    format_type = getattr(args, "format", "external")
     mode = (
         PROFILING_MODE_ALL
-        if args.format == "gecko"
+        if format_type == "gecko"
         else _parse_mode(args.mode)
     )
 
@@ -1169,19 +1321,17 @@ def _handle_attach(args):
     )
 
     output_file = None
-    if args.format == "binary":
+    if format_type == "binary":
         output_file = args.outfile or _generate_output_filename(args.format, args.pid)
 
-    # Create the appropriate collector
-    collector = _create_collector(
-        args.format, args.sample_interval_usec, skip_idle, args.opcodes, mode,
-        output_file=output_file,
-        compression=getattr(args, 'compression', 'auto'),
-        diff_baseline=args.diff_baseline
+    collector = _create_selected_collector(
+        args, "attach", sample_interval_usec=args.sample_interval_usec,
+        skip_idle=skip_idle, mode=mode, output_file=output_file,
+        target_pid=args.pid,
     )
 
     with _get_child_monitor_context(args, args.pid):
-        collector = sample(
+        sample(
             args.pid,
             collector,
             duration_sec=args.duration,
@@ -1193,8 +1343,9 @@ def _handle_attach(args):
             gc=args.gc,
             opcodes=args.opcodes,
             blocking=args.blocking,
+            sample_interval_usec=args.sample_interval_usec,
         )
-        _handle_output(collector, args, args.pid, mode)
+        _finalize_collector(collector, args, "attach", args.pid, mode)
 
 
 def _handle_dump(args):
@@ -1279,17 +1430,14 @@ def _handle_run(args):
     if args.format == "binary":
         output_file = args.outfile or _generate_output_filename(args.format, process.pid)
 
-    # Create the appropriate collector
-    collector = _create_collector(
-        args.format, args.sample_interval_usec, skip_idle, args.opcodes, mode,
-        output_file=output_file,
-        compression=getattr(args, 'compression', 'auto'),
-        diff_baseline=args.diff_baseline
-    )
-
-    with _get_child_monitor_context(args, process.pid):
-        try:
-            collector = sample(
+    try:
+        collector = _create_selected_collector(
+            args, "run", sample_interval_usec=args.sample_interval_usec,
+            skip_idle=skip_idle, mode=mode, output_file=output_file,
+            target_pid=process.pid,
+        )
+        with _get_child_monitor_context(args, process.pid):
+            sample(
                 process.pid,
                 collector,
                 duration_sec=args.duration,
@@ -1301,18 +1449,19 @@ def _handle_run(args):
                 gc=args.gc,
                 opcodes=args.opcodes,
                 blocking=args.blocking,
+                sample_interval_usec=args.sample_interval_usec,
             )
-            _handle_output(collector, args, process.pid, mode)
-        finally:
-            # Terminate the main subprocess - child profilers finish when their
-            # target processes exit
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=_PROCESS_KILL_TIMEOUT_SEC)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
+            _finalize_collector(collector, args, "run", process.pid, mode)
+    finally:
+        # Terminate the main subprocess - child profilers finish when their
+        # target processes exit
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=_PROCESS_KILL_TIMEOUT_SEC)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
 
 
 def _handle_live_attach(args, pid):

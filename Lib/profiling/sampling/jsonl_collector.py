@@ -91,7 +91,8 @@ class JsonlCollector(StackTraceCollector):
     """
 
     def __init__(self, sample_interval_usec, *, skip_idle=False, mode=None):
-        super().__init__(sample_interval_usec, skip_idle=skip_idle)
+        super().__init__(skip_idle=skip_idle)
+        self.sample_interval_usec = sample_interval_usec
         self.run_id = uuid.uuid4().hex
 
         self._string_to_id = {}
@@ -107,7 +108,7 @@ class JsonlCollector(StackTraceCollector):
 
         self._mode = mode
 
-    def process_frames(self, frames, _thread_id, weight=1):
+    def process_frames(self, frames, _thread_id, weight=1, timestamps_us=None):
         self._samples_total += weight
         self._seen_frame_ids.clear()
 

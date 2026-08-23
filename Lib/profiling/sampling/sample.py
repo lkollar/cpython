@@ -47,6 +47,22 @@ MIN_SAMPLES_FOR_TUI = 200
 MAX_PENDING_SAMPLES = 8192
 
 
+def _store_builtin_run_stats(collector, sample_interval_usec, duration_sec,
+                             sample_rate, error_rate, missed_samples, mode):
+    """Store final sampling statistics on built-in report collectors."""
+    # Keep this lifecycle detail out of the public Collector contract.  The
+    # imports are local to avoid coupling collector implementations at import
+    # time.
+    from .heatmap_collector import HeatmapCollector
+    from .stack_collector import FlamegraphCollector
+
+    if isinstance(collector, (FlamegraphCollector, HeatmapCollector)):
+        collector.set_stats(
+            sample_interval_usec, duration_sec, sample_rate,
+            error_rate, missed_samples, mode=mode,
+        )
+
+
 def _resolve_python_pid(pid):
     """On Windows, if pid is a venvlauncher process, return the child Python PID.
 
@@ -240,9 +256,10 @@ class SampleProfiler:
             if isinstance(collector, BinaryCollector):
                 self._print_binary_stats(collector)
 
-        # Pass stats to flamegraph collector if it's the right type
-        if hasattr(collector, 'set_stats'):
-            collector.set_stats(self.sample_interval_usec, running_time_sec, sample_rate, error_rate, missed_samples, mode=self.mode)
+        _store_builtin_run_stats(
+            collector, self.sample_interval_usec, running_time_sec,
+            sample_rate, error_rate, missed_samples, self.mode,
+        )
 
         if num_samples < expected_samples and not is_live_mode and not interrupted:
             print(
@@ -475,6 +492,7 @@ def sample(
     gc=True,
     opcodes=False,
     blocking=False,
+    sample_interval_usec=None,
 ):
     """Sample a process using the provided collector.
 
@@ -492,12 +510,15 @@ def sample(
         gc: Whether to include GC frames
         opcodes: Whether to include opcode information
         blocking: Whether to stop all threads before sampling for consistent snapshots
+        sample_interval_usec: Sampling interval. Defaults to the collector's
+            ``sample_interval_usec`` attribute.
 
     Returns:
         The collector with collected samples
     """
-    # Get sample interval from collector
-    sample_interval_usec = collector.sample_interval_usec
+    # Get sample interval from collector unless explicitly supplied.
+    if sample_interval_usec is None:
+        sample_interval_usec = collector.sample_interval_usec
 
     # PROFILING_MODE_ALL implies no skipping at all
     if mode == PROFILING_MODE_ALL:

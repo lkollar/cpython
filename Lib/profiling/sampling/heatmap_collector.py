@@ -339,9 +339,10 @@ class HeatmapCollector(StackTraceCollector):
     # File naming and formatting constants
     FILE_INDEX_FORMAT = "file_{:04d}.html"
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, sample_interval_usec, *, skip_idle=False):
         """Initialize the heatmap collector with data structures for analysis."""
-        super().__init__(*args, **kwargs)
+        super().__init__(skip_idle=skip_idle)
+        self.sample_interval_usec = sample_interval_usec
 
         # Sample counting data structures
         self.line_samples = collections.Counter()
@@ -407,7 +408,7 @@ class HeatmapCollector(StackTraceCollector):
         }
         self.stats.update(kwargs)
 
-    def process_frames(self, frames, thread_id, weight=1):
+    def process_frames(self, frames, thread_id, weight=1, timestamps_us=None):
         """Process stack frames and count samples per line.
 
         Args:

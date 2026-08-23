@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from .constants import (
     DEFAULT_LOCATION,
     THREAD_STATUS_HAS_GIL,
@@ -142,6 +143,25 @@ def iter_async_frames(awaited_info_list):
     yield from _build_linear_stacks(leaf_task_ids, task_map, child_to_parent)
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CollectorContext:
+    """Configuration and provenance passed to an external collector factory."""
+
+    command: str
+    target_pid: int | None
+    input_file: str | None
+    requested_output_file: str | None
+    sample_interval_usec: int
+    duration_sec: float | None
+    sampling_mode: str | None
+    all_threads: bool | None
+    async_aware: str | None
+    native: bool | None
+    gc: bool | None
+    opcodes: bool | None
+    blocking: bool | None
+
+
 class Collector(ABC):
     aggregating = False
 
@@ -159,7 +179,7 @@ class Collector(ABC):
         """
 
     def collect_failed_sample(self):
-        """Collect data about a failed sample attempt."""
+        """Record a recoverable sampling attempt with no snapshot."""
 
     @abstractmethod
     def export(self, filename):
